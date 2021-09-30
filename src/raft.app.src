@@ -1,0 +1,15 @@
+{application, raft,
+ [{description, "Raft"},
+  {vsn, git},
+  {registered, []},
+  {mod, {raft_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.
