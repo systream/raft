@@ -144,7 +144,9 @@ out_of_range(Config) ->
   LogOverFirst = {log_ref, Pid, -10},
 
   ?assertEqual({error, {bad_log_pos, 10000, {1, 10}}}, raft_log:stream(LogOverLast, self())),
-  ?assertEqual({error, {bad_log_pos, -10, {1, 10}}}, raft_log:stream(LogOverFirst, self())).
+
+  % auto fallback for first known item
+  ?assertMatch({ok, _}, raft_log:stream(LogOverFirst, self())).
 
 overwrite(Config) ->
   Log = ?config(ref, Config),
@@ -185,7 +187,9 @@ retention_time(_Config) ->
 
   timer:sleep(2005),
   _NewLog3 = raft_log:append("test_1", NewLog2),
-  {error, _} = wait_for_log_stream(raft_log:stream(Log, self()), []),
+
+  % fallback for first item
+  {ok, _}  = wait_for_log_stream(raft_log:stream(Log, self()), []),
 
   {ok, Data4} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
   ?assertEqual([{102, "test_1"}], Data4).

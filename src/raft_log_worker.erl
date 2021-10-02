@@ -135,15 +135,19 @@ handle_call(#stream_req{pos = Pos, target = Target}, _From, State = #state{last 
   io:format(user, "Nothing to streamlog lastpos == last ~n", []),
   send_log_stream_end(Target, StreamRef),
   {reply, {ok, StreamRef}, State};
+handle_call(#stream_req{pos = LogPos} = Stream, From, State = #state{first = First})
+  when LogPos+1 < First ->
+  handle_call(Stream#stream_req{pos = first}, From, State);
 % stream request is out of range
 handle_call(#stream_req{pos = LogPos}, _From, State = #state{first = First, last = Last})
-  when LogPos+1 < First orelse LogPos+1 > Last ->
+  when LogPos+1 > Last ->
   {reply, {error, {bad_log_pos, LogPos, {First, Last}}}, State};
 handle_call(#stream_req{pos = Pos, target = Target}, _From, State = #state{ref = Ref})
   when is_number(Pos) ->
   StreamRef = {self(), make_ref()},
   io:format(user, "streamlog to ~p ~n", [Pos]),
-  {ok, Pid} = proc_lib:start_link(?MODULE, stream_log, [Ref, StreamRef, Target, Pos+1]),
+  {ok, _Pid} = proc_lib:start_link(?MODULE, stream_log, [Ref, StreamRef, Target, Pos+1]),
+  io:format(user, "streamlog process ~p ~n", [_Pid]),
   {reply, {ok, StreamRef}, State};
 
 handle_call(_Request, _From, State = #state{}) ->
@@ -154,10 +158,8 @@ handle_cast(_Request, State = #state{}) ->
   {noreply, State}.
 
 % log_streamer process died, end of streaming
-handle_info({'EXIT', _Pid, _Reason}, State = #state{
-
-}) ->
-  io:format(user, "Pid stopped: ~p~n", [_Pid]),
+handle_info({'EXIT', _Pid, _Reason}, State = #state{}) ->
+  io:format(user, "Pid stopped: ~p -> ~p~n", [_Pid, _Reason]),
   %send_log_stream_end(Target, StreamRef),
   {noreply, State};
 handle_info(cleanup, State = #state{first = undefined}) ->

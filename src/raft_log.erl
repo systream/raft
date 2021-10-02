@@ -16,7 +16,7 @@
 -export([new/0, new/1,
          append/2,
          destroy/1,
-         stream/2, read_stream/2, get_pos/1]).
+         stream/2, read_stream/2, get_pos/1, set_log_pos/2]).
 
 -spec new() -> log_ref().
 new() ->
@@ -30,6 +30,10 @@ new(Opts) ->
 -spec get_pos(log_ref()) -> non_neg_integer() | undefined.
 get_pos(#log_ref{last_pos = Pos}) ->
   Pos.
+
+-spec set_log_pos(log_ref(), non_neg_integer() | undefined) -> log_ref().
+set_log_pos(Log = #log_ref{}, Pos) ->
+  Log#log_ref{last_pos = Pos}.
 
 -spec append(term(), log_ref()) -> log_ref().
 append(Command, #log_ref{pid = Pid, last_pos = Pos} = Ref) ->

@@ -10,10 +10,15 @@
 
 -behaviour(gen_statem).
 
+-define(LOG(Msg, Args), io:format(user, Msg, Args)).
+%-define(LOG(_Msg, _Args), ok).
+
 % election timeouts
--define(MAX_HEARTBEAT_TIMEOUT, 15000).
--define(MIN_HEARTBEAT_TIMEOUT, 5000).
+-define(MAX_HEARTBEAT_TIMEOUT, 25000).
+-define(MIN_HEARTBEAT_TIMEOUT, 15000).
 -define(HEARTBEAT_GRACE_TIME, 5000).
+
+-define(CONSENSUS_TIMEOUT, 5000).
 
 -define(HEARTBEAT_STATE_TIMEOUT(Timeout), {state_timeout, Timeout, heartbeat_timeout}).
 -define(HEARTBEAT_STATE_TIMEOUT, ?HEARTBEAT_STATE_TIMEOUT(get_timeout())).
@@ -58,6 +63,11 @@
   command :: term()
 }).
 
+-record(execute_log_req, {
+  log_pos :: pos_integer(),
+  command :: term()
+}).
+
 -record(append_log_ack, {
   log_pos :: pos_integer(),
   collaborator :: pid()
@@ -91,20 +101,20 @@ start_link(CallbackModule) ->
 
 -spec join(pid(), pid()) -> ok.
 join(ActualClusterMember, NewClusterMember) ->
-  gen_statem:call(ActualClusterMember, {join, NewClusterMember}).
+  gen_statem:call(ActualClusterMember, {join, NewClusterMember}, 30000).
 
 -spec leave(pid(), pid()) -> ok.
 leave(ClusterMember, MemberToLeave) ->
-  gen_statem:call(ClusterMember, {leave, MemberToLeave}).
+  gen_statem:call(ClusterMember, {leave, MemberToLeave}, 30000).
 
 -spec status(pid()) -> {state_name(), term(), pid(), [pid()]}.
 status(ClusterMember) ->
-  gen_statem:call(ClusterMember, status).
+  gen_statem:call(ClusterMember, status, 30000).
 
 -spec command(pid(), term()) ->
   ok.
 command(ActualClusterMember, Command) ->
-  gen_statem:call(ActualClusterMember, {command, Command}).
+  gen_statem:call(ActualClusterMember, {command, Command}, 30000).
 
 %%%===================================================================
 %%% gen_statem callbacks
@@ -115,12 +125,11 @@ command(ActualClusterMember, Command) ->
 %% gen_statem:start_link/[3,4], this function is called by the new
 %% process to initialize.
 init(CallbackModule) ->
-  io:format(user, "[~p] starting ~p~n", [self(), CallbackModule]),
-  process_flag(trap_exit, true),
-  {ok, follower, #state{collaborators = [self()],
-                        callback = CallbackModule,
-                        user_state = apply(CallbackModule, init, []),
-                        log = raft_log:new()}}.
+  erlang:process_flag(trap_exit, true),
+  ?LOG("[~p] starting ~p~n", [self(), CallbackModule]),
+  {ok, follower, init_user_state(#state{collaborators = [self()],
+                                        callback = CallbackModule,
+                                        log = raft_log:new()})}.
 
 %% @private
 %% @doc This function is called by a gen_statem when it needs to find out
@@ -148,16 +157,15 @@ handle_event({call, From}, status, StateName,
 %% %%%%%%%%%%%%%%%
 %% Follower
 %% %%%%%%%%%%%%%%%
-
 handle_event(enter, _PrevStateName, follower, #state{collaborators = [Collaborator]} = _State)
   when Collaborator =:= self() -> % alone in cluster, no one will send heartbeat
-  io:format(user, "[~p, follower] start follower~n", [self()]),
+  ?LOG("[~p, follower] start follower~n", [self()]),
   {keep_state_and_data, [?HEARTBEAT_STATE_TIMEOUT(0)]};
-handle_event(enter, _PrevStateName, follower, _State) ->
-  io:format(user, "[~p, follower] become follower~n", [self()]),
-  {keep_state_and_data, [?HEARTBEAT_STATE_TIMEOUT]};
+handle_event(enter, _PrevStateName, follower, State) ->
+  ?LOG("[~p, follower] become follower and catch_up~n", [self()]),
+  {keep_state, catch_up(State), [?HEARTBEAT_STATE_TIMEOUT]};
 handle_event(state_timeout, heartbeat_timeout, follower, State) ->
-  io:format(user, "[~p, follower] heartbeat timeout~n", [self()]),
+  ?LOG("[~p, follower] heartbeat timeout~n", [self()]),
   {next_state, candidate, State};
 
 handle_event(cast, #append_log_req{log_pos = NewLogPos, command = Command}, follower,
@@ -173,18 +181,28 @@ handle_event(cast, #append_log_req{log_pos = NewLogPos, command = Command}, foll
                                                collaborator_log_pos = Pos, collaborator = self()}),
       {keep_state, catch_up(State), [?HEARTBEAT_STATE_TIMEOUT]}
   end;
+handle_event(cast, #execute_log_req{log_pos = ActualLogPos, command = Command}, follower,
+             #state{log = LogRef} = State) ->
+  Pos = raft_log:get_pos(LogRef),
+  case Pos =:= ActualLogPos of
+    true ->
+      {reply, _, NewState} = execute_log(Command, State),
+      {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
+    _ ->
+      {keep_state, catch_up(State), [?HEARTBEAT_STATE_TIMEOUT]}
+  end;
 
 %% %%%%%%%%%%%%%%%
 %% Candidate
 %% %%%%%%%%%%%%%%%
 handle_event(enter, _PrevStateName, candidate, State = #state{term = Term}) ->
   NewState = State#state{term = Term+1, votes = 0},
-  io:format(user, "[~p, candidate] become candidate~n", [self()]),
+  ?LOG("[~p, candidate] become candidate~n", [self()]),
   ask_for_vote(NewState, self()),
   {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
 handle_event(cast, {accept, Term, Voter}, candidate,
           #state{term = Term, collaborators = Collaborators, votes = Votes} = State) ->
-  io:format(user, "[~p, candidate] accept ~p ~p~n", [self(), Term, Voter]),
+  ?LOG("[~p, candidate] accept ~p ~p  -> ~p ~n", [self(), Term, Voter, Collaborators]),
   case lists:member(Voter, Collaborators) of
     true ->
       NewState = State#state{votes = Votes+1},
@@ -206,58 +224,63 @@ handle_event(state_timeout, heartbeat_timeout, candidate, State) ->
 %% Leader
 %% %%%%%%%%%%%%%%%
 handle_event(enter, _PrevStateName, leader, State) ->
-  io:format(user, "[~p, leader] become leader~n", [self()]),
+  ?LOG("[~p, leader] become leader~n", [self()]),
   {keep_state, State#state{leader = self()},
-   [{state_timeout, rand:uniform(?MIN_HEARTBEAT_TIMEOUT-10)+10, heartbeat_timeout}]};
+   [{state_timeout, get_min_timeout(), heartbeat_timeout}]};
 handle_event(state_timeout, heartbeat_timeout, leader, State) ->
   send_heartbeat(State),
-  {keep_state_and_data, [{state_timeout, ?MIN_HEARTBEAT_TIMEOUT, heartbeat_timeout}]};
+  {keep_state_and_data, [{state_timeout, get_min_timeout(), heartbeat_timeout}]};
 handle_event({call, From}, {command, Command}, leader, #state{log = Log,
-                                                              collaborators = Collaborators,
-                                                              callback = CallbackModule,
-                                                              user_state = UserState} = State) ->
-  io:format(user, "[~p, leader] command ~p~n", [self(), Command]),
+                                                              collaborators = Collaborators} = State) ->
+  ?LOG("[~p, leader] command ~p~n", [self(), Command]),
   NewLog = raft_log:append(Command, Log),
 
-  AppendReq = #append_log_req{log_pos = raft_log:get_pos(NewLog), command = Command},
-  [gen_statem:cast(Collaborator, AppendReq) || Collaborator <- Collaborators],
+  LogPos = raft_log:get_pos(NewLog),
+  AppendReq = #append_log_req{log_pos = LogPos, command = Command},
+  [gen_statem:cast(Collaborator, AppendReq) || Collaborator <- Collaborators, Collaborator =/= self()],
 
-  %@TODO: wait for majority replylog
-
-  case apply(CallbackModule, execute, [Command, UserState]) of
-    {reply, Reply, NewUserState} ->
-      gen_statem:reply(From, Reply),
-      {keep_state, State#state{user_state = NewUserState, log = NewLog}, []}
+  %@TODO: better
+  case log_append_majority(LogPos, get_majority_number(length(Collaborators)), 1, 0) of
+    true ->
+      case execute_log(Command, State) of
+        {reply, Reply, NewState} ->
+          gen_statem:reply(From, Reply),
+          ExecuteLogReq = #execute_log_req{log_pos = raft_log:get_pos(NewLog), command = Command},
+          [gen_statem:cast(Collaborator, ExecuteLogReq) || Collaborator <- Collaborators, Collaborator =/= self()],
+          {keep_state, NewState#state{log = NewLog}, []}
+      end;
+    false ->
+      gen_statem:reply(From, {error, no_majority}),
+      keep_state_and_data
   end;
 handle_event({call, From}, #catch_up_req{log_pos = LogPos, target = Pid}, leader,
              #state{log = Log}) ->
-  io:format(user, "[~p, leader] stream req ~p -> ~p~n", [self(), From, LogPos]),
-  Ref = raft_log:stream(Log, Pid),
-  gen_statem:reply(From, Ref),
+  ?LOG("[~p, leader] stream req ~p -> ~p~n", [self(), From, LogPos]),
+  gen_statem:reply(From, raft_log:stream(raft_log:set_log_pos(Log, LogPos), Pid)),
   keep_state_and_data;
 
 handle_event({call, From}, {join, Pid}, leader, #state{collaborators = Collaborators} = State) ->
-  io:format(user, "[~p, leader] join ~p~n", [self(), Pid]),
+  ?LOG("[~p, leader] join ~p~n", [self(), Pid]),
   NewState = State#state{collaborators = lists:usort([Pid | Collaborators])},
   send_change_state(NewState),
   gen_statem:reply(From, ok),
   {keep_state, NewState, []};
 handle_event({call, From}, {leave, Leader}, leader,
              #state{leader = Leader, collaborators = Collaborators} = State) ->
-  io:format(user, "[~p, leader] leave leader ~p~n", [self(), Leader]),
+  ?LOG("[~p, leader] leave leader ~p~n", [self(), Leader]),
   RemoteState = State#state{collaborators = lists:delete(Leader, Collaborators)},
   send_change_state(RemoteState),
   gen_statem:reply(From, ok),
   {next_state, follower, State#state{collaborators = [self()]}, []};
 handle_event({call, From}, {leave, Pid}, leader, #state{collaborators = Collaborators} = State) ->
-  io:format(user, "[~p, leader] leave ~p~n", [self(), Pid]),
+  ?LOG("[~p, leader] leave ~p~n", [self(), Pid]),
   NewState = State#state{collaborators = lists:delete(Pid, Collaborators)},
-  send_change_state(NewState),
+  send_change_state(NewState, Collaborators),
   gen_statem:reply(From, ok),
   {keep_state, NewState, []};
 
 handle_event(cast, {proxy, Type, Context}, leader, State) ->
-  io:format(user, "[~p, leader] got proxy ~p~n", [self(), {proxy, Type, Context}]),
+  ?LOG("[~p, leader] got proxy ~p~n", [self(), {proxy, Type, Context}]),
   handle_event(Type, Context, leader, State);
 
 handle_event(cast, {proxy, _Type, _Context}, _, #state{leader = undefined}) ->
@@ -273,11 +296,14 @@ handle_event(cast, #heartbeat_req{term = Term, leader = Leader}, _StateName,
              #state{term = Term, leader = Leader}) ->
   {keep_state_and_data, [?HEARTBEAT_STATE_TIMEOUT]};
 handle_event(cast, #heartbeat_req{term = NewTerm, leader = Leader}, _StateName,
-             #state{collaborators = Collaborators, term = Term} = State) when NewTerm > Term ->
+             #state{collaborators = Collaborators, term = Term, log = Log} = State)
+  when NewTerm > Term ->
   case lists:member(Leader, Collaborators) of
     true ->
-      io:format("New leader: ~p -> ~p~n", [Leader, State]),
-      NewState = new_leader(State#state{term = NewTerm}, Leader),
+      ?LOG("New leader: ~p -> ~p~n", [Leader, State]),
+      NewState = State#state{term = NewTerm,
+                             log = raft_log:set_log_pos(Log, 0),
+                             leader = Leader},
       {next_state, follower, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
     _ ->
       % drop
@@ -317,34 +343,40 @@ handle_event(cast, {vote_request, Target, NewTerm}, _StateName,
 
 %% proxy requests to leader
 handle_event({call, _From}, _Request, _StateName, #state{leader = undefined} = _State) ->
-  io:format(user, "[~p, ~p] postpone proxy req ~p~n", [self(), _StateName, _Request]),
+  ?LOG("[~p, ~p] postpone proxy req ~p~n", [self(), _StateName, _Request]),
   {keep_state_and_data, [postpone]};
 
 handle_event({call, From}, {command, Command}, _StateName, #state{leader = Leader} = _State) ->
-  io:format(user, "[~p, ~p] proxy req ~p~n", [self(), _StateName, {command, Command}]),
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {command, Command}]),
   gen_statem:cast(Leader, {proxy, {call, From}, {command, Command}}),
   keep_state_and_data;
 handle_event({call, From}, {join, Pid}, _StateName, #state{leader = Leader} = _State) ->
-  io:format(user, "[~p, ~p] proxy req ~p~n", [self(), _StateName, {join, Pid}]),
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {join, Pid}]),
   gen_statem:cast(Leader, {proxy, {call, From}, {join, Pid}}),
   keep_state_and_data;
 handle_event({call, From}, {leave, Pid}, _StateName, #state{leader = Leader} = _State) ->
-  io:format(user, "[~p, ~p] proxy req ~p~n", [self(), _StateName, {leave, Pid}]),
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {leave, Pid}]),
   gen_statem:cast(Leader, {proxy, {call, From}, {leave, Pid}}),
   keep_state_and_data;
 
 % state change req
-handle_event(cast, #change_state_req{term = Term, collaborators = Collaborators, leader = Leader},
-             _, #state{} = State) ->
+handle_event(cast,
+             #change_state_req{term = Term, collaborators = Collaborators, leader = Leader} = Cr,
+             _, #state{log = Log} = State) ->
+  ?LOG("[~p] state change req: ~p~n", [self(), Cr]),
   case lists:member(self(), Collaborators) of
     true ->
-      new_leader(State, Leader),
-      {next_state, follower, State#state{term = Term, collaborators = Collaborators,
-                                         leader = Leader, votes = 0, voted_for_term = Term}};
+      NewState = init_user_state(State#state{term = Term, collaborators = Collaborators,
+                                             leader = Leader, votes = 0, voted_for_term = Term,
+                                             log = raft_log:set_log_pos(Log, 0)}),
+      link_collaborators(State, NewState),
+      {next_state, follower, NewState};
     _ ->
-      new_leader(State, undefined),
-      {next_state, follower, State#state{term = Term, collaborators = [self()], leader = undefined,
-                                         votes = 0, voted_for_term = Term}}
+      NewState = init_user_state(State#state{term = Term, collaborators = [self()], leader = undefined,
+                                             votes = 0, voted_for_term = Term,
+                                             log = raft_log:set_log_pos(Log, 0)}),
+      link_collaborators(State, NewState),
+      {next_state, follower, NewState}
   end;
 
 
@@ -352,14 +384,37 @@ handle_event(info, {'EXIT', Leader, _Type}, _StateName,
              #state{collaborators = Collaborators, leader = Leader} = State) ->
   % leader died
   NewCollaborators = lists:delete(Leader, Collaborators),
-  {keep_state, State#state{collaborators = NewCollaborators}, ?HEARTBEAT_STATE_TIMEOUT(0)};
+  {keep_state, State#state{collaborators = NewCollaborators},
+   ?HEARTBEAT_STATE_TIMEOUT(rand:uniform(10))};
+
 handle_event(info, {'EXIT', Pid, _Type}, _StateName,
              #state{collaborators = Collaborators} = State) ->
-  io:format(user, "[~p, ~p] got exit from ~p~n", [self(), _StateName, Pid]),
+  ?LOG("[~p, ~p] got exit from ~p~n", [self(), _StateName, Pid]),
   {keep_state, State#state{collaborators = lists:delete(Pid, Collaborators)}};
-handle_event(_EventType, _EventContent, StateName, State) ->
-  io:format(user, "follower unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n",
-            [_EventType, _EventContent, State, StateName]),
+
+handle_event(info, {'DOWN', _MonitorRef, _Type, Leader, _Info}, _StateName,
+             #state{collaborators = Collaborators, leader = Leader} = State) ->
+  % leader died
+  NewCollaborators = lists:delete(Leader, Collaborators),
+  {keep_state, State#state{collaborators = NewCollaborators},
+   ?HEARTBEAT_STATE_TIMEOUT(rand:uniform(10))};
+handle_event(info, {'DOWN', _MonitorRef, _Type, Pid, _Info}, _StateName,
+             #state{collaborators = Collaborators} = State) ->
+  ?LOG("[~p, ~p] got exit from ~p~n", [self(), _StateName, Pid]),
+  {keep_state, State#state{collaborators = lists:delete(Pid, Collaborators)}};
+
+handle_event(_EventType, #heartbeat_req{leader = Leader} = _EventContent, Sname, State) ->
+  ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p~n Ls: ~p~n",
+       [self(), Sname, _EventType, _EventContent, State, catch sys:get_state(Leader)]),
+  keep_state_and_data;
+handle_event(_EventType, _EventContent, leader, State) ->
+  ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p~n",
+       [self(), leader, _EventType, _EventContent, State]),
+  keep_state_and_data;
+handle_event(_EventType, _EventContent, StateName, State = #state{leader = Leader}) ->
+  ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n Leader stat: ~p~n",
+            [self(), StateName, _EventType, _EventContent, State, StateName, catch sys:get_state
+            (Leader)]),
   keep_state_and_data.
 
 %% @private
@@ -380,7 +435,7 @@ code_change(_OldVsn, StateName, State = #state{}, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 have_majority(#state{collaborators = Collaborators, votes = Votes}) ->
-  ((length(Collaborators) div 2) + 1) =< Votes.
+  get_majority_number(length(Collaborators)) =< Votes.
 
 ask_for_vote(#state{term = Term, collaborators = Collaborators}, Target) ->
   [gen_server:cast(Pid, {vote_request, Target, Term}) || Pid <- Collaborators],
@@ -390,35 +445,86 @@ send_heartbeat(#state{collaborators = Collaborators, term = Term, leader = Leade
   Req = #heartbeat_req{leader = Leader, term = Term},
   [gen_server:cast(Pid, Req) || Pid <- Collaborators, Pid =/= self()].
 
-send_change_state(#state{collaborators = Collaborators, term = Term, leader = Leader}) ->
+send_change_state(#state{term = Term, collaborators = Collaborators, leader = Leader},
+                  TargetCollaborators) ->
   ChangeState = #change_state_req{collaborators = Collaborators, term = Term, leader = Leader},
-  [gen_server:cast(Pid, ChangeState) || Pid <- Collaborators, Pid =/= self()].
+  [gen_server:cast(Pid, ChangeState) || Pid <- TargetCollaborators, Pid =/= self()].
+
+send_change_state(#state{collaborators = Collaborators} = State) ->
+  send_change_state(State, Collaborators).
 
 get_timeout() ->
-  Rand = rand:uniform(?MAX_HEARTBEAT_TIMEOUT-?MIN_HEARTBEAT_TIMEOUT),
-  ?MIN_HEARTBEAT_TIMEOUT+Rand+?HEARTBEAT_GRACE_TIME.
+  Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
+  Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
+  GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
+  Rand = rand:uniform(Max-Min),
+  Min+Rand+GraceTime.
 
-new_leader(#state{leader = undefined} = State, undefined) ->
+get_min_timeout() ->
+  application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT).
+
+link_collaborators(#state{collaborators = Collaborators},
+                   #state{collaborators = NewCollaborators}) ->
+  LeavingCollaborators = Collaborators -- NewCollaborators,
+
+  lists:foreach(fun erlang:unlink/1, LeavingCollaborators),
+  JoiningCollaborators = NewCollaborators -- Collaborators,
+  lists:foreach(fun erlang:link/1, JoiningCollaborators),
+  lists:foreach(fun(Pid) -> erlang:monitor(process, Pid) end, JoiningCollaborators).
+
+catch_up(#state{leader = undefined} = State) ->
   State;
-new_leader(#state{leader = undefined} = State, NewLeader) ->
-  link(NewLeader),
-  State#state{leader = NewLeader};
-new_leader(#state{leader = Leader} = State, NewLeader) when is_pid(Leader) ->
-  unlink(Leader),
-  new_leader(State#state{leader = undefined}, NewLeader).
-
 catch_up(#state{leader = Leader, log = Log} = State) ->
-  Ref = gen_statem:call(Leader, #catch_up_req{log_pos = raft_log:get_pos(Log), target = self()}),
-  {ok, NewLog} = read_log_stream(Ref, Log),
-  State#state{log = NewLog}.
+  CatchupReq = #catch_up_req{log_pos = raft_log:get_pos(Log), target = self()},
+  case catch gen_statem:call(Leader, CatchupReq) of
+    {ok, Ref} ->
+      {ok, NewState} = read_log_stream(Ref, State),
+      NewState;
+    {'EXIT', _} ->
+      State;
+    {error, _} ->
+      State
+  end.
 
-read_log_stream(Ref, Log) ->
+read_log_stream(Ref, #state{log = Log} = State) ->
   case raft_log:read_stream(Ref, 35000) of
     {ok, _Pos, Data} ->
       NewLog = raft_log:append(Data, Log),
-      read_log_stream(Ref, NewLog);
+      {reply, _, NewState} = execute_log(Data, State),
+      read_log_stream(Ref, NewState#state{log = NewLog});
     '$end_of_stream' ->
-      {ok, Log};
+      {ok, State};
     timeout ->
       timeout
   end.
+
+
+init_user_state(#state{callback = CallbackModule} = State) ->
+  State#state{user_state = apply(CallbackModule, init, [])}.
+
+execute_log(Command, #state{callback = CallbackModule, user_state = UserState} = State) ->
+  ?LOG("[~p] execute log command ~p~n", [self(), Command]),
+  case apply(CallbackModule, execute, [Command, UserState]) of
+    {reply, Reply, NewUserState} ->
+      {reply, Reply, State#state{user_state = NewUserState}}
+  end.
+
+log_append_majority(_LogPos, Target, Ack, _Nack) when Target =< Ack ->
+  true;
+log_append_majority(_LogPos, Target, _Ack, Nack) when Target =< Nack ->
+  false;
+log_append_majority(LogPos, Target, Ack, Nack) ->
+  receive
+    {'$gen_cast', #append_log_ack{log_pos = LogPos, collaborator = _Collaborator}} ->
+      ?LOG("[~p] ~p got append_log ACK from ~p~n" ,[self(), LogPos, _Collaborator]),
+      log_append_majority(LogPos, Target, Ack+1, Nack);
+    {'$gen_cast', #append_log_nack{log_pos = LogPos, collaborator = _Collaborator}} ->
+      ?LOG("[~p] ~p got append_log NACK from ~p~n" ,[self(), LogPos, _Collaborator]),
+      log_append_majority(LogPos, Target, Ack, Nack+1)
+  after application:get_env(raft, consensus_timeout, ?CONSENSUS_TIMEOUT) ->
+    ?LOG("[~p] ~p log_append_majdority TIMEOUT ~n" ,[self(), LogPos]),
+    false
+  end.
+
+get_majority_number(CollaboratorCount) ->
+  (CollaboratorCount div 2) + 1.

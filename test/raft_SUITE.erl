@@ -28,7 +28,11 @@ suite() ->
 %% Reason = term()
 %%--------------------------------------------------------------------
 init_per_suite(Config) ->
-  application:ensure_all_started(raft),
+  {ok, _} = application:ensure_all_started(raft),
+  application:set_env(raft, max_heartbeat_timeout, 2500),
+  application:set_env(raft, min_heartbeat_timeout, 500),
+  application:set_env(raft, heartbeat_grace_time, 1000),
+  application:set_env(raft, consensus_timeout, 1000),
   Config.
 
 %%--------------------------------------------------------------------
@@ -91,7 +95,17 @@ end_per_testcase(_TestCase, _Config) ->
 %% N = integer() | forever
 %%--------------------------------------------------------------------
 groups() ->
-  [].
+  [
+    {parallel_group, [parallel, shuffle],
+     [instant_leader_when_alone,
+      join_cluster,
+      new_leader,
+      leave_join,
+      catch_up_after_join,
+      catch_up_slave_is_ahead,
+      catch_up_after_rejoin
+    ]}
+  ].
 
 %%--------------------------------------------------------------------
 %% Function: all() -> GroupsAndTestCases | {skip,Reason}
@@ -101,10 +115,7 @@ groups() ->
 %% Reason = term()
 %%--------------------------------------------------------------------
 all() ->
-  [ instant_leader_when_alone,
-    join_cluster,
-    new_leader,
-    leave_join
+  [ {group, parallel_group}
   ].
 
 %%--------------------------------------------------------------------
@@ -117,7 +128,7 @@ all() ->
 %%--------------------------------------------------------------------
 instant_leader_when_alone(_Config) ->
   {ok, Pid} = raft:start(raft_test_cb),
-  timer:sleep(10),
+  wait_until_leader([Pid]),
   ?assertMatch({leader, _, Pid, [Pid]}, raft:status(Pid)).
 
 join_cluster(_Config) ->
@@ -171,6 +182,74 @@ leave_join(_Config) ->
   ?assertMatch({leader, _, Leader, [Leader]}, raft:status(Leader)),
 
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])).
+
+catch_up_after_join(_Config) ->
+  {ok, Leader} = raft:start(raft_test_cb),
+  {ok, Slave1} = raft:start(raft_test_cb),
+
+  Counter = raft:command(Leader, {store, test, 1}),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  ok = raft:join(Leader, Slave1),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
+  timer:sleep(100),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  % kill the leader to transfer leadership to Slave1 and get the data
+  exit(Leader, kill),
+  wait_until_leader([Slave1]),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
+
+catch_up_slave_is_ahead(_Config) ->
+  {ok, Leader} = raft:start(raft_test_cb),
+  {ok, Slave1} = raft:start(raft_test_cb),
+
+  Counter = raft:command(Leader, {store, test, 1}),
+  _ = raft:command(Slave1, {store, test, 1}),
+  _ = raft:command(Slave1, {store, test, 2}),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  ok = raft:join(Leader, Slave1),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
+  timer:sleep(100),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  % kill the leader to transfer leadership to Slave1 and get the data
+  exit(Leader, kill),
+  wait_until_leader([Slave1]),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
+
+
+catch_up_after_rejoin(_Config) ->
+  {ok, Leader} = raft:start(raft_test_cb),
+  {ok, Slave1} = raft:start(raft_test_cb),
+
+  _ = raft:command(Leader, {store, test, 1}),
+  _ = raft:command(Slave1, {store, test, 1}),
+  _ = raft:command(Slave1, {store, test, 2}),
+  Counter = raft:command(Leader, {store, test, 1}),
+
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  ok = raft:join(Leader, Slave1),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
+  timer:sleep(100),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  ok = raft:leave(Leader, Slave1),
+  timer:sleep(100),
+  ?assertEqual(0, raft:command(Slave1, {get, test})),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  ok = raft:join(Leader, Slave1),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
+  timer:sleep(100),
+  ?assertEqual(Counter, raft:command(Leader, {get, test})),
+
+  % kill the leader to transfer leadership to Slave1 and get the data
+  exit(Leader, kill),
+  wait_until_leader([Slave1]),
+  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
 
 
 wait_until_leader(Pids) ->
