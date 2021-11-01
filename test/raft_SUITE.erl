@@ -165,21 +165,30 @@ leave_join(_Config) ->
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
   ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
+  io:format(user, "~n** Cluster formed! **~n", []),
 
   ok = raft:leave(Leader, Slave1),
   ?assertMatch({leader, _, Leader, [Leader, Slave2]}, raft:status(Leader)),
+  io:format(user, "~n** Slave1 leaved! **~n", []),
 
   ok = raft:leave(Slave2, Leader),
+  io:format(user, "~n** Slave2 called to leave leader leaved! **~n", []),
   wait_until_leader([Leader]),
   ?assertMatch({leader, _, Leader, [Leader]}, raft:status(Leader)),
+
+  io:format(user, "~n** leader leaved! **~n", []),
 
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
   ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
 
+  io:format(user, "~n** Cluster re formed! **~n", []),
+
   ok = raft:leave(Slave2, Leader),
+  io:format(user, "~n** Leader asked to leve by Slave2! **~n", []),
   wait_until_leader([Leader]),
   ?assertMatch({leader, _, Leader, [Leader]}, raft:status(Leader)),
+  io:format(user, "~n** Slave 2 leaved! **~n", []),
 
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])).
 

@@ -12,11 +12,11 @@
 
 
 test() ->
-  {ok, A} = start(prop_raft),
-  {ok, B} = start(prop_raft),
-  {ok, C} = start(prop_raft),
-  {ok, D} = start(prop_raft),
-  {ok, E} = start(prop_raft),
+  {ok, A} = start(raft_test_cb),
+  {ok, B} = start(raft_test_cb),
+  {ok, C} = start(raft_test_cb),
+  {ok, D} = start(raft_test_cb),
+  {ok, E} = start(raft_test_cb),
   join(C, D),
   [spawn(fun() -> [command(A, {store, {I, X}, I}) || I <- lists:seq(1, 5000)] end)
    || X <- lists:seq(1, 5)],

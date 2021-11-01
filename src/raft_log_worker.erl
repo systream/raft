@@ -14,6 +14,8 @@
 
 -define(SERVER, ?MODULE).
 
+-define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
+
 -record(retention, {
   time = 604800, % one week, in sec
   max_item = 1000000
@@ -93,19 +95,19 @@ opts([{retention_time, Time} | Opts], #state{retention = Retention} = State) ->
 
 handle_call(#append_req{data = Data, last_pos = Pos}, _From,
             #state{ref = Ref, last = undefined, first = undefined} = State) ->
-  io:format(user, "[~p] Lp: ~p - ~p <> ~p ~n", [Ref, Pos, undefined, undefined]),
+  ?LOG("[~p] Lp: ~p - ~p <> ~p ~n", [Ref, Pos, undefined, undefined]),
   NewPos = Pos + 1,
   insert_log(Ref, NewPos, Data),
   {reply, {ok, NewPos}, State#state{last = NewPos, first = NewPos}};
 handle_call(#append_req{data = Data, last_pos = Pos}, _From,
             #state{ref = Ref, first = First, last = Last} = State) when Last =:= Pos ->
-  io:format(user, "[~p] Lp: ~p - F: ~p <>L:~p ~n", [Ref, Pos, First, Last]),
+  ?LOG("[~p] Lp: ~p - F: ~p <>L:~p ~n", [Ref, Pos, First, Last]),
   NewPos = Last+1,
   insert_log(Ref, NewPos, Data),
   {reply, {ok, NewPos}, State#state{last = NewPos}};
 handle_call(#append_req{last_pos = Pos} = Req, From,
             #state{ref = Ref, first = First, last = Last} = State) when Last > Pos ->
-  io:format(user, "[~p] LastPos > Cpos Lp: ~p - F: ~p <>L:~p ~n", [Ref, Pos, First, Last]),
+  ?LOG("[~p] LastPos > Cpos Lp: ~p - F: ~p <>L:~p ~n", [Ref, Pos, First, Last]),
   NewPos = Pos+1,
   [ets:delete(Ref, PosToDel) || PosToDel <- lists:seq(NewPos, Last)],
   NewState = case NewPos of
@@ -118,21 +120,21 @@ handle_call(#append_req{last_pos = Pos} = Req, From,
 % nothing to stream, send end steam msg
 handle_call(#stream_req{target = Target}, _From, State = #state{first = undefined}) ->
   StreamRef = {self(), make_ref()},
-  io:format(user, "Nothing to streamlog ~n", []),
+  ?LOG("Nothing to streamlog ~n", []),
   send_log_stream_end(Target, StreamRef),
   {reply, {ok, StreamRef}, State};
 handle_call(#stream_req{pos = first, target = Target}, _From,
             State = #state{ref = Ref, first = First}) ->
-  io:format(user, "Streamlog Set to first: ~p ~n", [First]),
+  ?LOG("Streamlog Set to first: ~p ~n", [First]),
   StreamRef = {self(), make_ref()},
-  io:format(user, "streamlog to first ~p ~n", [First]),
+  ?LOG("streamlog to first ~p ~n", [First]),
   {ok, _} = proc_lib:start_link(?MODULE, stream_log, [Ref, StreamRef, Target, First]),
   {reply, {ok, StreamRef}, State};
 % requested stream from the last log pos, nothing to stream
 handle_call(#stream_req{pos = Pos, target = Target}, _From, State = #state{last = Last})
   when Pos =:= Last ->
   StreamRef = {self(), make_ref()},
-  io:format(user, "Nothing to streamlog lastpos == last ~n", []),
+  ?LOG("Nothing to streamlog lastpos == last ~n", []),
   send_log_stream_end(Target, StreamRef),
   {reply, {ok, StreamRef}, State};
 handle_call(#stream_req{pos = LogPos} = Stream, From, State = #state{first = First})
@@ -145,13 +147,13 @@ handle_call(#stream_req{pos = LogPos}, _From, State = #state{first = First, last
 handle_call(#stream_req{pos = Pos, target = Target}, _From, State = #state{ref = Ref})
   when is_number(Pos) ->
   StreamRef = {self(), make_ref()},
-  io:format(user, "streamlog to ~p ~n", [Pos]),
+  ?LOG("streamlog to ~p ~n", [Pos]),
   {ok, _Pid} = proc_lib:start_link(?MODULE, stream_log, [Ref, StreamRef, Target, Pos+1]),
-  io:format(user, "streamlog process ~p ~n", [_Pid]),
+  ?LOG("streamlog process ~p ~n", [_Pid]),
   {reply, {ok, StreamRef}, State};
 
 handle_call(_Request, _From, State = #state{}) ->
-  io:format(user, "unhandled_request: ~p~n State: ~p~n", [_Request, State]),
+  ?LOG("unhandled_request: ~p~n State: ~p~n", [_Request, State]),
   {reply, ok, State}.
 
 handle_cast(_Request, State = #state{}) ->
@@ -159,7 +161,7 @@ handle_cast(_Request, State = #state{}) ->
 
 % log_streamer process died, end of streaming
 handle_info({'EXIT', _Pid, _Reason}, State = #state{}) ->
-  io:format(user, "Pid stopped: ~p -> ~p~n", [_Pid, _Reason]),
+  ?LOG("Pid stopped: ~p -> ~p~n", [_Pid, _Reason]),
   %send_log_stream_end(Target, StreamRef),
   {noreply, State};
 handle_info(cleanup, State = #state{first = undefined}) ->
@@ -175,7 +177,7 @@ terminate(_Reason, _State = #state{}) ->
 
 stream_log(Ref, StreamRef, Target, LogPos) ->
   % Stream the first item then ack back
-  io:format(user, "[~p] stream: ~p~n", [StreamRef, LogPos]),
+  ?LOG("[~p] stream: ~p~n", [StreamRef, LogPos]),
   send_log_stream(Target, StreamRef, LogPos, get_log(Ref, LogPos)),
   proc_lib:init_ack({ok, self()}),
   do_stream_log(Ref, StreamRef, Target, ets:next(Ref, LogPos)).

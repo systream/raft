@@ -10,7 +10,7 @@
 
 -behaviour(gen_statem).
 
--define(LOG(Msg, Args), io:format(user, Msg, Args)).
+-define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
 %-define(LOG(_Msg, _Args), ok).
 
 % election timeouts
@@ -45,6 +45,12 @@
   log :: raft_log:log_ref(),
   votes = 0 :: non_neg_integer(),
   voted_for_term = 1 :: pos_integer()
+}).
+
+-record(candidate_state, {
+  state :: #state{},
+  votes_ack = 0 :: non_neg_integer(),
+  votes_nack = 0 :: non_neg_integer()
 }).
 
 -record(heartbeat_req, {
@@ -82,6 +88,21 @@
 -record(catch_up_req, {
   log_pos :: pos_integer(),
   target :: pid()
+}).
+
+-record(vote_req, {
+  candidate :: pid(),
+  term :: pos_integer()
+}).
+
+-record(vote_ack, {
+  term :: pos_integer(),
+  voter = self() :: pid()
+}).
+
+-record(vote_nack, {
+  term :: pos_integer(),
+  voter = self() :: pid()
 }).
 
 -callback init() -> State when State :: term().
@@ -149,11 +170,6 @@ format_status(_Opt, [_PDict, StateName, _State]) ->
 %% gen_statem receives an event from call/2, cast/2, or as a normal
 %% process message, this function is called.
 
-handle_event({call, From}, status, StateName,
-             #state{leader = Leader, term = Term, collaborators = Collaborators}) ->
-  gen_statem:reply(From, {StateName, Term, Leader, Collaborators}),
-  keep_state_and_data;
-
 %% %%%%%%%%%%%%%%%
 %% Follower
 %% %%%%%%%%%%%%%%%
@@ -183,41 +199,13 @@ handle_event(cast, #append_log_req{log_pos = NewLogPos, command = Command}, foll
   end;
 handle_event(cast, #execute_log_req{log_pos = ActualLogPos, command = Command}, follower,
              #state{log = LogRef} = State) ->
-  Pos = raft_log:get_pos(LogRef),
-  case Pos =:= ActualLogPos of
+  case raft_log:get_pos(LogRef) =:= ActualLogPos of
     true ->
       {reply, _, NewState} = execute_log(Command, State),
       {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
     _ ->
       {keep_state, catch_up(State), [?HEARTBEAT_STATE_TIMEOUT]}
   end;
-
-%% %%%%%%%%%%%%%%%
-%% Candidate
-%% %%%%%%%%%%%%%%%
-handle_event(enter, _PrevStateName, candidate, State = #state{term = Term}) ->
-  NewState = State#state{term = Term+1, votes = 0},
-  ?LOG("[~p, candidate] become candidate~n", [self()]),
-  ask_for_vote(NewState, self()),
-  {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
-handle_event(cast, {accept, Term, Voter}, candidate,
-          #state{term = Term, collaborators = Collaborators, votes = Votes} = State) ->
-  ?LOG("[~p, candidate] accept ~p ~p  -> ~p ~n", [self(), Term, Voter, Collaborators]),
-  case lists:member(Voter, Collaborators) of
-    true ->
-      NewState = State#state{votes = Votes+1},
-      case have_majority(NewState) of
-        true ->
-          {next_state, leader, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
-        _ ->
-          {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]}
-      end;
-    _ ->
-      % ignore
-      keep_state_and_data
-  end;
-handle_event(state_timeout, heartbeat_timeout, candidate, State) ->
-  {repeat_state, State};
 
 
 %% %%%%%%%%%%%%%%%
@@ -230,8 +218,9 @@ handle_event(enter, _PrevStateName, leader, State) ->
 handle_event(state_timeout, heartbeat_timeout, leader, State) ->
   send_heartbeat(State),
   {keep_state_and_data, [{state_timeout, get_min_timeout(), heartbeat_timeout}]};
-handle_event({call, From}, {command, Command}, leader, #state{log = Log,
-                                                              collaborators = Collaborators} = State) ->
+
+handle_event({call, From}, {command, Command}, leader,
+             #state{log = Log, collaborators = Collaborators} = State) ->
   ?LOG("[~p, leader] command ~p~n", [self(), Command]),
   NewLog = raft_log:append(Command, Log),
 
@@ -245,7 +234,7 @@ handle_event({call, From}, {command, Command}, leader, #state{log = Log,
       case execute_log(Command, State) of
         {reply, Reply, NewState} ->
           gen_statem:reply(From, Reply),
-          ExecuteLogReq = #execute_log_req{log_pos = raft_log:get_pos(NewLog), command = Command},
+          ExecuteLogReq = #execute_log_req{log_pos = LogPos, command = Command},
           [gen_statem:cast(Collaborator, ExecuteLogReq) || Collaborator <- Collaborators, Collaborator =/= self()],
           {keep_state, NewState#state{log = NewLog}, []}
       end;
@@ -253,6 +242,7 @@ handle_event({call, From}, {command, Command}, leader, #state{log = Log,
       gen_statem:reply(From, {error, no_majority}),
       keep_state_and_data
   end;
+
 handle_event({call, From}, #catch_up_req{log_pos = LogPos, target = Pid}, leader,
              #state{log = Log}) ->
   ?LOG("[~p, leader] stream req ~p -> ~p~n", [self(), From, LogPos]),
@@ -283,19 +273,111 @@ handle_event(cast, {proxy, Type, Context}, leader, State) ->
   ?LOG("[~p, leader] got proxy ~p~n", [self(), {proxy, Type, Context}]),
   handle_event(Type, Context, leader, State);
 
+%% %%%%%%%%%%%%%%%
+%% Candidate
+%% %%%%%%%%%%%%%%%
+handle_event(enter, _PrevStateName, candidate,
+             State = #state{term = Term, collaborators = Collaborators}) ->
+  ?LOG("[~p, candidate] become candidate~n", [self()]),
+  NewTerm = Term+1,
+  VoteReq = #vote_req{candidate = self(), term = NewTerm},
+  [gen_statem:cast(Collaborator, VoteReq) || Collaborator <- Collaborators],
+  {keep_state, #candidate_state{state = State#state{term = NewTerm}}, [?HEARTBEAT_STATE_TIMEOUT]};
+handle_event(cast, #vote_ack{term = Term, voter = Voter}, candidate,
+             #candidate_state{state = #state{term = Term, collaborators = Collaborators}} = State) ->
+  ?LOG("[~p, candidate] accept ~p ~p  -> ~p ~n", [self(), Term, Voter, Collaborators]),
+  case lists:member(Voter, Collaborators) of
+    true ->
+      NewState = State#candidate_state{votes_ack = State#candidate_state.votes_ack+1},
+      case have_majority(NewState) of
+        true ->
+          {next_state, leader, NewState#candidate_state.state, [?HEARTBEAT_STATE_TIMEOUT]};
+        _ ->
+          {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]}
+      end;
+    _ ->
+      % ignore
+      keep_state_and_data
+  end;
+handle_event(cast, #vote_nack{term = Term, voter = Voter}, candidate,
+             #candidate_state{state = #state{term = Term, collaborators = Collaborators}} = State) ->
+  ?LOG("[~p, candidate] decline ~p ~p  -> ~p ~n", [self(), Term, Voter, Collaborators]),
+  case lists:member(Voter, Collaborators) of
+    true ->
+      NewState = State#candidate_state{votes_nack = State#candidate_state.votes_nack +1},
+      case have_majority(NewState) of
+        false ->
+          {repeat_state, NewState#candidate_state.state};
+        _ ->
+          {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]}
+      end;
+    _ ->
+      % ignore
+      keep_state_and_data
+  end;
+handle_event(state_timeout, heartbeat_timeout, candidate, State) ->
+  {repeat_state, State#candidate_state.state};
+
+% no leader currently
 handle_event(cast, {proxy, _Type, _Context}, _, #state{leader = undefined}) ->
   {keep_state_and_data, [postpone]};
+% now we have leader, but unfortunately we need to forward it
 handle_event(cast, {proxy, Type, Context}, _StateName, #state{leader = Leader}) ->
   gen_statem:cast(Leader, {proxy, Type, Context}),
+  keep_state_and_data;
+
+handle_event(EventType, EventContent, candidate = StateName,
+             #candidate_state{state = State} = CandidateState) ->
+  case handle_common_event(EventType, EventContent, StateName, State) of
+    {keep_state, #state{} = NewState, Actions} ->
+      {keep_state, CandidateState#candidate_state{state = NewState}, Actions};
+    {keep_state, #state{} = NewState} ->
+      {keep_state, CandidateState#candidate_state{state = NewState}};
+    {repeat_state, #state{} = NewState} ->
+      {repeat_state, CandidateState#candidate_state{state = NewState}};
+    {next_state, StateName, #state{} = NewState, Actions} ->
+      {next_state, StateName, CandidateState#candidate_state{state = NewState}, Actions};
+    {next_state, StateName, #state{} = NewState} ->
+      {next_state, StateName, CandidateState#candidate_state{state = NewState}};
+    Else ->
+      Else
+  end;
+handle_event(EventType, EventContent, StateName, State) ->
+  handle_common_event(EventType, EventContent, StateName, State).
+
+
+handle_common_event({call, From}, status, StateName,
+             #state{leader = Leader, term = Term, collaborators = Collaborators}) ->
+  gen_statem:reply(From, {StateName, Term, Leader, Collaborators}),
+  keep_state_and_data;
+
+%% %%%%%%%%%%%%%%%
+%% Proxy to leader
+%% %%%%%%%%%%%%%%%
+handle_common_event({call, _From}, _Request, _StateName, #state{leader = undefined} = _State) ->
+  ?LOG("[~p, ~p] postpone proxy req ~p~n", [self(), _StateName, _Request]),
+  {keep_state_and_data, [postpone]};
+
+handle_common_event({call, From}, {command, Command}, _StateName, #state{leader = Leader} = _State) ->
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {command, Command}]),
+  gen_statem:cast(Leader, {proxy, {call, From}, {command, Command}}),
+  keep_state_and_data;
+handle_common_event({call, From}, {join, Pid}, _StateName, #state{leader = Leader} = _State) ->
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {join, Pid}]),
+  gen_statem:cast(Leader, {proxy, {call, From}, {join, Pid}}),
+  keep_state_and_data;
+handle_common_event({call, From}, {leave, Pid}, _StateName, #state{leader = Leader} = _State) ->
+  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {leave, Pid}]),
+  gen_statem:cast(Leader, {proxy, {call, From}, {leave, Pid}}),
   keep_state_and_data;
 
 %% %%%%%%%%%%%%%%%
 %% Heartbeat
 %% %%%%%%%%%%%%%%%
-handle_event(cast, #heartbeat_req{term = Term, leader = Leader}, _StateName,
+handle_common_event(cast, #heartbeat_req{term = Term, leader = Leader}, _StateName,
              #state{term = Term, leader = Leader}) ->
   {keep_state_and_data, [?HEARTBEAT_STATE_TIMEOUT]};
-handle_event(cast, #heartbeat_req{term = NewTerm, leader = Leader}, _StateName,
+handle_common_event(cast, #heartbeat_req{term = NewTerm, leader = Leader}, _StateName,
              #state{collaborators = Collaborators, term = Term, log = Log} = State)
   when NewTerm > Term ->
   case lists:member(Leader, Collaborators) of
@@ -314,53 +396,35 @@ handle_event(cast, #heartbeat_req{term = NewTerm, leader = Leader}, _StateName,
 %% Vote
 %% %%%%%%%%%%%%%%%
 % vote myself ;)
-handle_event(cast, {vote_request, Target, NewTerm}, _StateName,
+handle_common_event(cast, #vote_req{candidate = Candidate, term = NewTerm}, _StateName,
              #state{voted_for_term = Term} = State)
-  when Target =:= self() andalso NewTerm > Term ->
-  gen_statem:cast(Target, {accept, NewTerm, self()}),
+  when Candidate =:= self() andalso NewTerm > Term ->
+  gen_statem:cast(Candidate, #vote_ack{term = NewTerm}),
   {keep_state, State#state{voted_for_term = NewTerm}};
-handle_event(cast, {vote_request, Target, NewTerm}, _StateName,
+handle_common_event(cast, #vote_req{candidate = Candidate, term = NewTerm}, _StateName,
              #state{collaborators = Collaborators, voted_for_term = Term} = State)
   when NewTerm > Term ->
-  case lists:member(Target, Collaborators) of
+  case lists:member(Candidate, Collaborators) of
     true ->
-      gen_statem:cast(Target, {accept, NewTerm, self()}),
+      gen_statem:cast(Candidate, #vote_ack{term = NewTerm}),
       {keep_state, State#state{voted_for_term = NewTerm}, [?HEARTBEAT_STATE_TIMEOUT]};
     _ ->
       % drop
       keep_state_and_data
   end;
-handle_event(cast, {vote_request, Target, NewTerm}, _StateName,
+handle_common_event(cast, #vote_req{candidate = Candidate, term = NewTerm}, _StateName,
              #state{collaborators = Collaborators} = _State) ->
-  case lists:member(Target, Collaborators) of
+  case lists:member(Candidate, Collaborators) of
     true ->
-      gen_statem:cast(Target, {reject, NewTerm, self()}),
+      gen_statem:cast(Candidate, #vote_nack{term = NewTerm}),
       {keep_state_and_data, [?HEARTBEAT_STATE_TIMEOUT]};
     _ ->
       % drop
       keep_state_and_data
   end;
 
-%% proxy requests to leader
-handle_event({call, _From}, _Request, _StateName, #state{leader = undefined} = _State) ->
-  ?LOG("[~p, ~p] postpone proxy req ~p~n", [self(), _StateName, _Request]),
-  {keep_state_and_data, [postpone]};
-
-handle_event({call, From}, {command, Command}, _StateName, #state{leader = Leader} = _State) ->
-  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {command, Command}]),
-  gen_statem:cast(Leader, {proxy, {call, From}, {command, Command}}),
-  keep_state_and_data;
-handle_event({call, From}, {join, Pid}, _StateName, #state{leader = Leader} = _State) ->
-  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {join, Pid}]),
-  gen_statem:cast(Leader, {proxy, {call, From}, {join, Pid}}),
-  keep_state_and_data;
-handle_event({call, From}, {leave, Pid}, _StateName, #state{leader = Leader} = _State) ->
-  ?LOG("[~p, ~p] proxy req ~p~n", [self(), _StateName, {leave, Pid}]),
-  gen_statem:cast(Leader, {proxy, {call, From}, {leave, Pid}}),
-  keep_state_and_data;
-
 % state change req
-handle_event(cast,
+handle_common_event(cast,
              #change_state_req{term = Term, collaborators = Collaborators, leader = Leader} = Cr,
              _, #state{log = Log} = State) ->
   ?LOG("[~p] state change req: ~p~n", [self(), Cr]),
@@ -378,43 +442,39 @@ handle_event(cast,
       link_collaborators(State, NewState),
       {next_state, follower, NewState}
   end;
-
-
-handle_event(info, {'EXIT', Leader, _Type}, _StateName,
+handle_common_event(info, {'EXIT', Leader, _Type}, _StateName,
              #state{collaborators = Collaborators, leader = Leader} = State) ->
   % leader died
   NewCollaborators = lists:delete(Leader, Collaborators),
   {keep_state, State#state{collaborators = NewCollaborators},
    ?HEARTBEAT_STATE_TIMEOUT(rand:uniform(10))};
 
-handle_event(info, {'EXIT', Pid, _Type}, _StateName,
+handle_common_event(info, {'EXIT', Pid, _Type}, _StateName,
              #state{collaborators = Collaborators} = State) ->
   ?LOG("[~p, ~p] got exit from ~p~n", [self(), _StateName, Pid]),
   {keep_state, State#state{collaborators = lists:delete(Pid, Collaborators)}};
 
-handle_event(info, {'DOWN', _MonitorRef, _Type, Leader, _Info}, _StateName,
+handle_common_event(info, {'DOWN', _MonitorRef, _Type, Leader, _Info}, _StateName,
              #state{collaborators = Collaborators, leader = Leader} = State) ->
   % leader died
   NewCollaborators = lists:delete(Leader, Collaborators),
   {keep_state, State#state{collaborators = NewCollaborators},
    ?HEARTBEAT_STATE_TIMEOUT(rand:uniform(10))};
-handle_event(info, {'DOWN', _MonitorRef, _Type, Pid, _Info}, _StateName,
+handle_common_event(info, {'DOWN', _MonitorRef, _Type, Pid, _Info}, _StateName,
              #state{collaborators = Collaborators} = State) ->
   ?LOG("[~p, ~p] got exit from ~p~n", [self(), _StateName, Pid]),
   {keep_state, State#state{collaborators = lists:delete(Pid, Collaborators)}};
-
-handle_event(_EventType, #heartbeat_req{leader = Leader} = _EventContent, Sname, State) ->
+handle_common_event(_EventType, #heartbeat_req{leader = Leader} = _EventContent, Sname, State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p~n Ls: ~p~n",
-       [self(), Sname, _EventType, _EventContent, State, catch sys:get_state(Leader)]),
+       [self(), Sname, _EventType, _EventContent, State, catch sys:get_state(Leader, 100)]),
   keep_state_and_data;
-handle_event(_EventType, _EventContent, leader, State) ->
-  ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p~n",
-       [self(), leader, _EventType, _EventContent, State]),
+handle_common_event(EventType, EventContent, StateName, #state{leader = undefined} = State) ->
+  ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n Leader: ~p~n",
+       [self(), StateName, EventType, EventContent, State, StateName, undefined]),
   keep_state_and_data;
-handle_event(_EventType, _EventContent, StateName, State = #state{leader = Leader}) ->
+handle_common_event(EventType, EventContent, StateName, #state{leader = Leader} = State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n Leader stat: ~p~n",
-            [self(), StateName, _EventType, _EventContent, State, StateName, catch sys:get_state
-            (Leader)]),
+       [self(), StateName, EventType, EventContent, State, StateName, catch sys:get_state(Leader, 100)]),
   keep_state_and_data.
 
 %% @private
@@ -422,7 +482,7 @@ handle_event(_EventType, _EventContent, StateName, State = #state{leader = Leade
 %% terminate. It should be the opposite of Module:init/1 and do any
 %% necessary cleaning up. When it returns, the gen_statem terminates with
 %% Reason. The return value is ignored.
-terminate(_Reason, _StateName, _State = #state{}) ->
+terminate(_Reason, _StateName, _State) ->
   ok.
 
 %% @private
@@ -434,12 +494,15 @@ code_change(_OldVsn, StateName, State = #state{}, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-have_majority(#state{collaborators = Collaborators, votes = Votes}) ->
-  get_majority_number(length(Collaborators)) =< Votes.
+have_majority(#candidate_state{state = #state{collaborators = Collaborators}} = State) ->
+  have_majority(State, get_majority_number(length(Collaborators))).
 
-ask_for_vote(#state{term = Term, collaborators = Collaborators}, Target) ->
-  [gen_server:cast(Pid, {vote_request, Target, Term}) || Pid <- Collaborators],
-  ok.
+have_majority(#candidate_state{votes_ack = VotesAck}, Majority) when VotesAck >= Majority ->
+  true;
+have_majority(#candidate_state{votes_nack = VotesNack}, Majority) when VotesNack >= Majority ->
+  false;
+have_majority(_State, _Majority) ->
+  not_enough_votes.
 
 send_heartbeat(#state{collaborators = Collaborators, term = Term, leader = Leader}) ->
   Req = #heartbeat_req{leader = Leader, term = Term},

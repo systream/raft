@@ -41,7 +41,7 @@ status([Pid | Tail]) ->
 %%%%%%%%%%%%%%%%%%
 prop_test() ->
     application:ensure_all_started(raft),
-    application:set_env(raft, max_heartbeat_timeout, 2500),
+    application:set_env(raft, max_heartbeat_timeout, 1500),
     application:set_env(raft, min_heartbeat_timeout, 500),
     application:set_env(raft, heartbeat_grace_time, 1000),
     application:set_env(raft, consensus_timeout, 1000),
@@ -71,9 +71,9 @@ command(#state{collaborators = Collaborators} = _State) ->
       {50, {call, raft, command, [OnCollaborator, {store, store_key(), pos_integer()}]}},
       {8, {call, raft, join, [OnCollaborator, oneof(Collaborators)]}},
       {2, {call, raft, leave, [OnCollaborator, oneof(Collaborators)]}},
-      {6, {call, ?MODULE, start_collaborator, []}},
-      %{1, {call, ?MODULE, kill_collaborator, [oneof(Collaborators)]}},
-      %{1, {call, ?MODULE, stop_collaborator, [oneof(Collaborators)]}},
+      {4, {call, ?MODULE, start_collaborator, []}},
+      {1, {call, ?MODULE, kill_collaborator, [oneof(Collaborators)]}},
+      {1, {call, ?MODULE, stop_collaborator, [oneof(Collaborators)]}},
       {5, {call, ?MODULE, status, [Collaborators]}}
     ]).
 %% @doc Determines whether a command should be valid under the
