@@ -10,11 +10,11 @@
 
 -behaviour(gen_statem).
 
--define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
-%-define(LOG(_Msg, _Args), ok).
+%-define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
+-define(LOG(_Msg, _Args), ok).
 
 % election timeouts
--define(MAX_HEARTBEAT_TIMEOUT, 25000).
+-define(MAX_HEARTBEAT_TIMEOUT, 35000).
 -define(MIN_HEARTBEAT_TIMEOUT, 15000).
 -define(HEARTBEAT_GRACE_TIME, 5000).
 
@@ -121,7 +121,7 @@ start_link(CallbackModule) ->
   gen_statem:start_link(?MODULE, CallbackModule, []).
 
 -spec join(pid(), pid()) -> ok.
-join(ActualClusterMember, NewClusterMember) ->
+join(ActualClusterMember, NewClusterMember) when is_pid(NewClusterMember) ->
   gen_statem:call(ActualClusterMember, {join, NewClusterMember}, 30000).
 
 -spec leave(pid(), pid()) -> ok.
@@ -466,7 +466,7 @@ handle_common_event(info, {'DOWN', _MonitorRef, _Type, Pid, _Info}, _StateName,
   {keep_state, State#state{collaborators = lists:delete(Pid, Collaborators)}};
 handle_common_event(_EventType, #heartbeat_req{leader = Leader} = _EventContent, Sname, State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p~n Ls: ~p~n",
-       [self(), Sname, _EventType, _EventContent, State, catch sys:get_state(Leader, 100)]),
+       [self(), Sname, _EventType, _EventContent, State, catch sys:get_state(Leader, 10)]),
   keep_state_and_data;
 handle_common_event(EventType, EventContent, StateName, #state{leader = undefined} = State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n Leader: ~p~n",
@@ -474,7 +474,7 @@ handle_common_event(EventType, EventContent, StateName, #state{leader = undefine
   keep_state_and_data;
 handle_common_event(EventType, EventContent, StateName, #state{leader = Leader} = State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n Leader stat: ~p~n",
-       [self(), StateName, EventType, EventContent, State, StateName, catch sys:get_state(Leader, 100)]),
+       [self(), StateName, EventType, EventContent, State, StateName, catch sys:get_state(Leader, 10)]),
   keep_state_and_data.
 
 %% @private

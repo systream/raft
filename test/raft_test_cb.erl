@@ -1,12 +1,12 @@
 %%%-------------------------------------------------------------------
-%%% @author Peter Tihanti
+%%% @author Peter Tihanyi
 %%% @copyright (C) 2021, systream
 %%% @doc
 %%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(raft_test_cb).
--author("Peter Tihanti").
+-author("Peter Tihanyi").
 
 -behavior(raft_collaborator).
 

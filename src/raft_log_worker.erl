@@ -14,7 +14,8 @@
 
 -define(SERVER, ?MODULE).
 
--define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
+%-define(LOG(Msg, Args), io:format(user, "[~p] " ++ Msg, [erlang:system_time(millisecond) | Args])).
+-define(LOG(_Msg, A_rgs), ok).
 
 -record(retention, {
   time = 604800, % one week, in sec

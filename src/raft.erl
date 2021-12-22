@@ -8,8 +8,14 @@
 -module(raft).
 -author("Peter Tihanyi").
 
--export([start/1, join/2, leave/2, status/1, command/2, test/0]).
+-export([start/1, join/2, leave/2, status/1, command/2, test/0, test_mult/0]).
 
+
+test_mult() ->
+  {Ok, []} = rpc:multicall(raft, start, [raft_process_registry]),
+  [{ok, FirstPid} | Rest] = Ok,
+  [ok = raft:join(FirstPid, Pid)  || {ok, Pid} <- Rest],
+  FirstPid.
 
 test() ->
   {ok, A} = start(raft_test_cb),
