@@ -26,10 +26,4 @@ init([]) ->
                         shutdown => 5000,
                         type => supervisor,
                         modules => [raft_collaborator_sup, raft_collaborator]},
-    Log = #{id => raft_log_sup,
-                        start => {raft_log_sup, start_link, []},
-                        restart => permanent,
-                        shutdown => 5000,
-                        type => worker,
-                        modules => [raft_log_sup]},
-    {ok, {SupFlags, [Log, CollaboratorSup]}}.
+    {ok, {SupFlags, [CollaboratorSup]}}.

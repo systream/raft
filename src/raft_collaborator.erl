@@ -14,17 +14,21 @@
 %-define(LOG(_Msg, _Args), ok).
 
 % election timeouts
+% erlang has monitors/links so do not really need timeouts, just in case.
 -define(MAX_HEARTBEAT_TIMEOUT, 35000).
 -define(MIN_HEARTBEAT_TIMEOUT, 15000).
 -define(HEARTBEAT_GRACE_TIME, 5000).
 
--define(CONSENSUS_TIMEOUT, 5000).
+-define(ELECTION_TIMEOUT(Timeout), {state_timeout, Timeout, election_timeout}).
+-define(ELECTION_TIMEOUT, ?ELECTION_TIMEOUT(get_timeout())).
 
--define(HEARTBEAT_STATE_TIMEOUT(Timeout), {state_timeout, Timeout, heartbeat_timeout}).
--define(HEARTBEAT_STATE_TIMEOUT, ?HEARTBEAT_STATE_TIMEOUT(get_timeout())).
+-define(JOIN_MEMBER_CMD, '$raft_join_member').
+-define(JOIN_MEMBER_CMD(Member), {?JOIN_MEMBER_CMD, Member}).
+-define(LEAVE_MEMBER_CMD, '$raft_leave_member').
+-define(LEAVE_MEMBER_CMD(Member), {?LEAVE_MEMBER_CMD, Member}).
 
 %% API
--export([start_link/1, status/1, command/2]).
+-export([start_link/1, status/1, command/2, join/2, leave/2]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -38,20 +42,10 @@
 
 -type(state_name() :: follower | candidate | leader).
 
--type(raft_term() :: non_neg_integer()).
--type(command() :: term()).
--type(log_index() :: pos_integer()).
-
--record(log_entry, {
-  log_index :: log_index(),
-  term :: raft_term(),
-  command :: command()
-}).
-
--type(log_entry() :: #log_entry{}).
+-include("raft.hrl").
 
 -record(follower_state, {
-
+  %committed_index :: log_index()
 }).
 
 -record(candidate_state, {
@@ -60,7 +54,7 @@
 }).
 
 -record(leader_state, {
-
+  %committed_index :: log_index()
 }).
 
 -type(follower_state() :: #follower_state{}).
@@ -74,9 +68,12 @@
 
   current_term = 0 :: raft_term(),
   voted_for :: pid() | undefined,
-  log = [] :: [log_entry()],
+  log :: raft_log:log_ref(),
 
   leader :: pid() | undefined,
+
+  committed_index :: log_index(),
+  last_applied :: log_index(),
 
   inner_state :: follower_state() | candidate_state() | leader_state() | undefined
 }).
@@ -100,10 +97,14 @@
   leader :: pid(),
   prev_log_index :: log_index(),
   prev_log_term :: raft_term(),
-  entries :: [log_entry()],
+  entries :: [command()],
   leader_commit_index :: log_index()
 }).
 
+-record(append_entries_resp, {
+  term :: raft_term(),
+  success :: boolean()
+}).
 -callback init() -> State when State :: term().
 
 -callback execute(Command, State) -> {reply, Reply, State} when
@@ -123,6 +124,14 @@ start_link(CallbackModule) ->
 status(ClusterMember) ->
   gen_statem:call(ClusterMember, status, 30000).
 
+-spec join(pid(), pid()) -> ok.
+join(ActualClusterMember, NewClusterMember) ->
+  command(ActualClusterMember, ?JOIN_MEMBER_CMD(NewClusterMember)).
+
+-spec leave(pid(), pid()) -> ok.
+leave(ClusterMember, MemberToLeave) ->
+  command(ClusterMember, ?LEAVE_MEMBER_CMD(MemberToLeave)).
+
 -spec command(pid(), term()) ->
   ok.
 command(ActualClusterMember, Command) ->
@@ -137,7 +146,8 @@ init(CallbackModule) ->
   erlang:process_flag(trap_exit, true),
   ?LOG("[~p] starting ~p~n", [self(), CallbackModule]),
   {ok, follower, init_user_state(#state{collaborators = [self()],
-                                        callback = CallbackModule})}.
+                                        callback = CallbackModule,
+                                        log = raft_log:new()})}.
 
 -spec callback_mode() -> [handle_event_function | state_enter].
 callback_mode() ->
@@ -158,11 +168,11 @@ handle_event(enter, _PrevStateName, follower, #state{collaborators = [Collaborat
   when Collaborator =:= self() ->
   % Alone in cluster, no one will send heartbeat, so step up for candidate immediately
   ?LOG("[~p, follower] start follower~n", [self()]),
-  {keep_state, State#state{inner_state = #follower_state{}}, [?HEARTBEAT_STATE_TIMEOUT(0)]};
+  {keep_state, State#state{inner_state = #follower_state{}}, [?ELECTION_TIMEOUT(0)]};
 handle_event(enter, _PrevStateName, follower, State) ->
   ?LOG("[~p, follower] become follower and catch_up~n", [self()]),
-  {keep_state, State#state{inner_state = #follower_state{}}, [?HEARTBEAT_STATE_TIMEOUT]};
-handle_event(state_timeout, heartbeat_timeout, follower, State) ->
+  {keep_state, State#state{inner_state = #follower_state{}}, [?ELECTION_TIMEOUT]};
+handle_event(state_timeout, election_timeout, follower, State) ->
   ?LOG("[~p, follower] heartbeat timeout~n", [self()]),
   {next_state, candidate, State};
 
@@ -170,7 +180,7 @@ handle_event(state_timeout, heartbeat_timeout, follower, State) ->
 %% Candidate
 %% %%%%%%%%%%%%%%%
 handle_event(enter, _PrevStateName, candidate,
-             State = #state{current_term = Term, collaborators = Collaborators}) ->
+             State = #state{current_term = Term, collaborators = Collaborators, log = Log}) ->
   % To begin an election, a follower increments its current term and transitions to candidate state
   ?LOG("[~p, candidate] Become candidate ~n", [self()]),
   NewTerm = Term+1,
@@ -178,10 +188,9 @@ handle_event(enter, _PrevStateName, candidate,
 
   VoteReq = #vote_req{
     term = NewTerm,
-    candidate = Me %,
-  % @TODO
-    %last_log_index = LastLogIndex,
-    %last_log_term = LastLogTerm
+    candidate = Me,
+    last_log_index = raft_log:last_index(Log),
+    last_log_term = raft_log:last_term(Log)
   },
 
   % It then votes for itself and issues RequestVote RPCs in parallel to each of
@@ -191,7 +200,7 @@ handle_event(enter, _PrevStateName, candidate,
   InnerState = #candidate_state{majority = majority_count(length(Collaborators))},
   NewState = State#state{current_term = NewTerm, inner_state = InnerState,
                          leader = undefined, voted_for = undefined},
-  {keep_state, NewState, [?HEARTBEAT_STATE_TIMEOUT]};
+  {keep_state, NewState, [?ELECTION_TIMEOUT]};
 
 % process vote reply
 handle_event(info, #vote_req_reply{term = Term, granted = true}, candidate,
@@ -209,8 +218,8 @@ handle_event(info, #vote_req_reply{term = Term, granted = false}, candidate,
   {keep_state, State = #state{current_term = Term, voted_for = undefined}};
 handle_event(info, #vote_req_reply{granted = false}, candidate, State) ->
   {keep_state, State};
-handle_event(state_timeout, heartbeat_timeout, candidate, State) ->
-  {repeat_state, State#state};
+handle_event(state_timeout, election_timeout, candidate, State) ->
+  {repeat_state, State};
 
 %% %%%%%%%%%%%%%%%%%
 %% All Servers:
@@ -219,24 +228,49 @@ handle_event(state_timeout, heartbeat_timeout, candidate, State) ->
 % log[lastApplied] to state machine (§5.3)
 % • If RPC request or response contains term T > currentTerm:
 % set currentTerm = T, convert to follower (§5.1)
-handle_event(info, #append_entries_req{term = Term}, _,
-             #state{current_term = CurrentTerm} = State) when Term > CurrentTerm ->
-  % @todo first bulletpoint
-  {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
+
+% Receiver implementation:
+% 1. Reply false if term < currentTerm (§5.1)
+% 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+% 3. If an existing entry conflicts with a new one (same index
+% but different terms), delete the existing entry and all that follow it (§5.3)
+% 4. Append any new entries not already in the log
+% 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+handle_event(info, #append_entries_req{term = Term, leader = Leader}, _,
+             #state{current_term = CurrentTerm}) when Term < CurrentTerm ->
+  send_msg(Leader, #append_entries_resp{term = CurrentTerm, success = false}),
+  keep_state_and_data;
+handle_event(info,
+             #append_entries_req{prev_log_index = PrevLogIndex, leader = Leader, term = Term,
+                                 leader_commit_index = LeaderCommitIndex} = AppendReq,
+             _StateName,
+             #state{log = Log, current_term = Term, committed_index = CI} = State) ->
+  case raft_log:get(Log, PrevLogIndex) of
+    {ok, {_Index, LogTerm, _Command}} when AppendReq#append_entries_req.term =/= LogTerm ->
+      send_msg(Leader, #append_entries_resp{term = Term, success = false}),
+      maybe_change_term(AppendReq, State);
+    _ ->
+      NewLog = append_commands(AppendReq, Log),
+      send_msg(Leader, #append_entries_resp{term = Term, success = true}),
+      NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CI, NewLog),
+      NewState = State#state{log = NewLog, current_term = Term, leader = Leader,
+                             committed_index = NewCommitIndex},
+      maybe_change_term(AppendReq, maybe_apply(NewState))
+  end;
 % handle vote requests
 % If votedFor is null or candidateId, and candidate’s log is at
 % least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 handle_event(info, #vote_req{term = Term, candidate = Candidate}, _StateName,
              #state{current_term = CurrentTerm} = State) when Term < CurrentTerm ->
-  erlang:send_nosuspend(Candidate, #vote_req_reply{term = CurrentTerm, granted = false}),
+  send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = false}),
   {keep_state, State};
 handle_event(info, #vote_req{candidate = Candidate}, _StateName,
              #state{current_term = CurrentTerm, voted_for = undefined} = State) ->
-  erlang:send_nosuspend(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
+  send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
   {keep_state, State#state{voted_for = Candidate}};
 handle_event(info, #vote_req{candidate = Candidate}, _StateName,
              #state{current_term = CurrentTerm, voted_for = Candidate} = State) ->
-  erlang:send_nosuspend(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
+  send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
   {keep_state, State};
 
 %% %%%%%%%%%%%%%%%
@@ -249,13 +283,24 @@ handle_event(enter, _PrevStateName, leader, State) ->
   % prevent election timeouts (§5.2)
   send_heartbeat(State),
   {keep_state, State#state{leader = self(), inner_state = #leader_state{}},
-   [{state_timeout, get_min_timeout(), heartbeat_timeout}]};
-handle_event(state_timeout, heartbeat_timeout, leader, State) ->
+   [{state_timeout, get_min_timeout(), election_timeout}]};
+handle_event(state_timeout, election_timeout, leader, State) ->
   send_heartbeat(State),
-  {keep_state_and_data, [{state_timeout, get_min_timeout(), heartbeat_timeout}]};
-handle_event({call, From}, {command, Command}, leader, _State) ->
+  {keep_state_and_data, [{state_timeout, get_min_timeout(), election_timeout}]};
+handle_event({call, From}, {command, Command}, leader,
+             #state{log = Log, current_term = Term} = State) ->
   ?LOG("[~p, leader] command (~p) ~p~n", [self(), From, Command]),
-  keep_state_and_data;
+  NewLog = raft_log:append(Log, Command, Term),
+
+  % send with old state (old log ref) to get last_term/last_index to previous
+  send_append_req([Command], State),
+
+  % @TODO: majority commit
+
+  NewState = State#state{log = NewLog},
+  {reply, Reply, NewState2} = execute(Command, raft_log:last_index(NewLog), NewState),
+  gen_statem:reply(From, Reply),
+  {keep_state, NewState2};
 
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
 %% Proxy commands to leader
@@ -275,7 +320,7 @@ handle_event(info, {proxy, Type, Context}, _StateName, #state{leader = Leader}) 
   gen_statem:cast(Leader, {proxy, Type, Context}),
   keep_state_and_data;
 
-handle_event(EventType, EventContent, StateName, #state = State) ->
+handle_event(EventType, EventContent, StateName, #state{} = State) ->
   ?LOG("[~p, ~p] unhandled: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n~n",
        [self(), StateName, EventType, EventContent, State, StateName]),
   keep_state_and_data.
@@ -286,7 +331,8 @@ handle_event(EventType, EventContent, StateName, #state = State) ->
 %% terminate. It should be the opposite of Module:init/1 and do any
 %% necessary cleaning up. When it returns, the gen_statem terminates with
 %% Reason. The return value is ignored.
-terminate(_Reason, _StateName, _State) ->
+terminate(_Reason, _StateName, #state{log = Log} = _State) ->
+  raft_log:destroy(Log),
   ok.
 
 %% @private
@@ -298,18 +344,23 @@ code_change(_OldVsn, StateName, State = #state{}, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-send_heartbeat(#state{collaborators = Collaborators, current_term = Term, leader = Leader}) ->
+send_heartbeat(State) ->
+  send_append_req([], State).
+
+send_append_req(Commands, #state{current_term = Term, leader = Leader,
+                                 log = Log, collaborators = Servers,
+                                 committed_index = CI}) ->
   AppendEntriesReq = #append_entries_req{term = Term,
                                          leader = Leader,
-                                         prev_log_index = 1,
-                                         prev_log_term = 1,
-                                         entries = [],
-                                         leader_commit_index = 1},
-  send(Collaborators, AppendEntriesReq).
+                                         prev_log_index = raft_log:last_index(Log),
+                                         prev_log_term = raft_log:last_term(Log),
+                                         entries = Commands,
+                                         leader_commit_index = CI},
+  send(Servers, AppendEntriesReq).
 
 send(Collaborators, Msg) ->
   Me = self(),
-  [erlang:send_nosuspend(Collaborator, Msg) || Collaborator <- Collaborators, Collaborator =/= Me].
+  [send_msg(Collaborator, Msg) || Collaborator <- Collaborators, Collaborator =/= Me].
 
 get_timeout() ->
   Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
@@ -326,3 +377,50 @@ init_user_state(#state{callback = CallbackModule} = State) ->
 
 majority_count(CollaboratorCount) ->
   (CollaboratorCount div 2) + 1.
+
+execute(Command, Index, #state{callback = CallbackModule, user_state = UserState} = State) ->
+  ?LOG("[~p] execute log command ~p~n", [self(), Command]),
+  case apply(CallbackModule, execute, [Command, UserState]) of
+    {reply, Reply, NewUserState} ->
+      {reply, Reply, State#state{user_state = NewUserState,
+                                 committed_index = Index}}
+  end.
+
+
+send_msg(Target, Msg) ->
+  erlang:send_nosuspend(Target, Msg).
+
+maybe_change_term(#append_entries_req{term = Term}, #state{current_term = CurrentTerm} = State)
+  when Term < CurrentTerm ->
+  {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
+maybe_change_term(_, State) ->
+  {keep_state, State}.
+
+maybe_delete_log(Log, #append_entries_req{prev_log_index = PrevLogIndex, term = AppendTerm}) ->
+  case raft_log:get(Log, PrevLogIndex) of
+    {ok, {Index, LogTerm, _Command}} when AppendTerm =/= LogTerm ->
+      % 3. If an existing entry conflicts with a new one (same index
+      % but different terms), delete the existing entry and all that follow it (§5.3)
+      raft_log:delete(Log, Index);
+    _ ->
+      Log
+  end.
+
+append_commands(#append_entries_req{entries = Commands, term = Term} = AppendReq, Log) ->
+  NewLog = maybe_delete_log(Log, AppendReq),
+  lists:foldl(fun(Command, CLog) -> raft_log:append(CLog, Command, Term) end, NewLog, Commands).
+
+% 5. If leaderCommit > commitIndex,
+% set commitIndex = min(leaderCommit, index of last new entry)
+maybe_update_commit_index(LeaderCI, CI, Log) when LeaderCI > CI ->
+  erlang:min(LeaderCI, raft_log:last_index(Log));
+maybe_update_commit_index(_LeaderCommitIndex, CommitIndex, _Log) ->
+  CommitIndex.
+
+maybe_apply(#state{last_applied = LastApplied, committed_index = CommittedIndex, log = Log} = State)
+  when CommittedIndex > LastApplied ->
+  {ok, {Index, _Term, Command}} = raft_log:get(Log, LastApplied+1),
+  {reply, _, NewState} = execute(Command, Index, State),
+  maybe_apply(NewState);
+maybe_apply(State) ->
+  State.
