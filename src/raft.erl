@@ -17,24 +17,47 @@ test_mult() ->
   [ok = raft:join(FirstPid, Pid)  || {ok, Pid} <- Rest],
   FirstPid.
 
+
 test() ->
+  application:set_env(raft, max_heartbeat_timeout, 15000),
+  application:set_env(raft, min_heartbeat_timeout, 5000),
+  application:set_env(raft, heartbeat_grace_time, 10000),
+  application:set_env(raft, consensus_timeout, 3000),
   {ok, A} = start(raft_test_cb),
   {ok, B} = start(raft_test_cb),
   {ok, C} = start(raft_test_cb),
   {ok, D} = start(raft_test_cb),
   {ok, E} = start(raft_test_cb),
   join(C, D),
-  [spawn(fun() -> [command(A, {store, {I, X}, I}) || I <- lists:seq(1, 5000)] end)
-   || X <- lists:seq(1, 5)],
-  timer:sleep(5000),
+  Parent = self(),
+  Pids = [spawn(fun() ->
+                  [command(A, {store, {I, X}, I}) || I <- lists:seq(1, 5)],
+                  Parent ! {ready, self()}
+                end) || X <- lists:seq(1, 3)],
+  [receive {ready, Pid} -> ok end || Pid <- Pids],
+  timer:sleep(1000),
   join(B, A),
   join(A, C),
   join(A, D),
   join(A, E),
   timer:sleep(5000),
-  StatusA = {_Type, _Term, _Leader, Collaborators} = status(A),
-  print(StatusA),
-  [print(status(Collaborator)) || Collaborator <- Collaborators].
+  print(status(A)),
+  [print(status(Collaborator)) || Collaborator <- [A, B, C, D, E]],
+
+  command(A, {store, {1, 2}, 3}),
+
+  timer:sleep(5000),
+  print(status(A)),
+  [print(status(Collaborator)) || Collaborator <- [A, B, C, D, E]],
+
+  timer:sleep(5000),
+  print(status(A)),
+  [print(status(Collaborator)) || Collaborator <- [A, B, C, D, E]],
+
+  timer:sleep(5000),
+  print(status(A)),
+  [print(status(Collaborator)) || Collaborator <- [A, B, C, D, E]],
+  [A, B, C, D, E].
 
 print({Type, Term, Leader, Collaborators}) ->
   io:format(user, "[~p,~p (~p)] -> ~p~n", [Leader, Type, Term, Collaborators]).
