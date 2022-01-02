@@ -8,7 +8,7 @@
 -module(raft_test_cb).
 -author("Peter Tihanyi").
 
--behavior(raft_collaborator).
+-behavior(raft_server).
 
 %% API
 -export([init/0, execute/2]).

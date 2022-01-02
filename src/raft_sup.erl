@@ -20,10 +20,10 @@ init([]) ->
     SupFlags = #{strategy => one_for_one,
                  intensity => 10,
                  period => 100},
-    CollaboratorSup = #{id => raft_collaborator_sup,
-                        start => {raft_collaborator_sup, start_link, []},
-                        restart => permanent,
-                        shutdown => 5000,
-                        type => supervisor,
-                        modules => [raft_collaborator_sup, raft_collaborator]},
-    {ok, {SupFlags, [CollaboratorSup]}}.
+    ServerSup = #{id => raft_server_sup,
+                  start => {raft_server_sup, start_link, []},
+                  restart => permanent,
+                  shutdown => 5000,
+                  type => supervisor,
+                  modules => [raft_server_sup, raft_server]},
+    {ok, {SupFlags, [ServerSup]}}.

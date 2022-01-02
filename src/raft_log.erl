@@ -11,13 +11,12 @@
 -export([new/0,
          append/3,
          destroy/1,
-         last_index/1, last_term/1, get/2, delete/2]).
+         last_index/1, last_term/1, get/2, delete/2, next_index/1]).
 
 -record(log_ref, {data_ref :: ets:tid(),
                   last_index = 0 :: log_index(),
-                  last_term = 0 :: raft_term(),
-                  prev_index = 0 :: log_index(),
-                  prev_term = 0 :: raft_term()}).
+                  last_term = 0 :: raft_term()}).
+
 -type(log_ref() :: #log_ref{}).
 
 -export_type([log_ref/0]).
@@ -41,8 +40,8 @@ last_term(#log_ref{last_term = Term}) ->
   Term.
 
 -spec append(log_ref(), command(), raft_term()) -> log_ref().
-append(#log_ref{data_ref = Ref, last_index = Pos} = LogRef, Command, Term) ->
-  NewPos = Pos+1,
+append(#log_ref{data_ref = Ref} = LogRef, Command, Term) ->
+  NewPos = next_index(LogRef),
   ets:insert(Ref, #log_entry{log_index = NewPos, term = Term, command = Command}),
   LogRef#log_ref{last_index = NewPos, last_term = Term}.
 
@@ -54,6 +53,10 @@ get(#log_ref{data_ref = Ref}, Index) ->
       [#log_entry{log_index = Index, term = Term, command = Command}] ->
           {ok, {Index, Term, Command}}
   end.
+
+-spec next_index(log_ref()) -> log_index().
+next_index(#log_ref{last_index = LastIndex}) ->
+    LastIndex+1.
 
 -spec delete(log_ref(), log_index()) -> log_ref().
 delete(#log_ref{data_ref = Ref, last_index = LastIndex} = LogRef, Index) when LastIndex < Index ->

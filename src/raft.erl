@@ -8,7 +8,7 @@
 -module(raft).
 -author("Peter Tihanyi").
 
--export([start/1, join/2, leave/2, status/1, command/2, test/0, test_mult/0]).
+-export([start/1, join/2, leave/2, status/1, command/2, test/0, test_mult/0, test_join/0]).
 
 
 test_mult() ->
@@ -17,6 +17,19 @@ test_mult() ->
   [ok = raft:join(FirstPid, Pid)  || {ok, Pid} <- Rest],
   FirstPid.
 
+test_join() ->
+
+  application:set_env(raft, max_heartbeat_timeout, 12500),
+  application:set_env(raft, min_heartbeat_timeout, 11500),
+  application:set_env(raft, heartbeat_grace_time, 500),
+  application:set_env(raft, consensus_timeout, 13000),
+  {ok, A} = start(raft_test_cb),
+  {ok, B} = start(raft_test_cb),
+  timer:sleep(300),
+  io:format(user, "========= started ===========~n~n", []),
+  raft:join(A, B),
+  print(status(A)),
+  print(status(B)).
 
 test() ->
   application:set_env(raft, max_heartbeat_timeout, 15000),
@@ -65,21 +78,21 @@ print({Type, Term, Leader, Collaborators}) ->
 
 -spec start(module()) -> {ok, pid()} | {error, term()}.
 start(Callback) ->
-  raft_collaborator_sup:start_collaborator(Callback).
+  raft_server_sup:start_server(Callback).
 
 -spec command(pid(), term()) ->
   ok.
 command(ClusterMember, Command) ->
-  raft_collaborator:command(ClusterMember, Command).
+  raft_server:command(ClusterMember, Command).
 
 -spec join(pid(), pid()) -> ok.
 join(ActualClusterMember, NewClusterMember) ->
-  raft_collaborator:join(ActualClusterMember, NewClusterMember).
+  raft_server:join(ActualClusterMember, NewClusterMember).
 
 -spec leave(pid(), pid()) -> ok.
 leave(ClusterMember, MemberToLeave) ->
-  raft_collaborator:leave(ClusterMember, MemberToLeave).
+  raft_server:leave(ClusterMember, MemberToLeave).
 
 -spec status(pid()) -> {follower | candidate | leader, term(), pid(), [pid()]}.
 status(ClusterMember) ->
-  raft_collaborator:status(ClusterMember).
+  raft_server:status(ClusterMember).
