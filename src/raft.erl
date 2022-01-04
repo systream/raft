@@ -8,7 +8,10 @@
 -module(raft).
 -author("Peter Tihanyi").
 
--export([start/1, join/2, leave/2, status/1, command/2, test/0, test_mult/0, test_join/0]).
+-export([start/1, stop/1,
+         join/2, leave/2,
+         status/1,
+         command/2, test/0, test_mult/0, test_join/0]).
 
 
 test_mult() ->
@@ -18,11 +21,6 @@ test_mult() ->
   FirstPid.
 
 test_join() ->
-
-  application:set_env(raft, max_heartbeat_timeout, 12500),
-  application:set_env(raft, min_heartbeat_timeout, 11500),
-  application:set_env(raft, heartbeat_grace_time, 500),
-  application:set_env(raft, consensus_timeout, 13000),
   {ok, A} = start(raft_test_cb),
   {ok, B} = start(raft_test_cb),
   timer:sleep(300),
@@ -79,6 +77,10 @@ print({Type, Term, Leader, Collaborators}) ->
 -spec start(module()) -> {ok, pid()} | {error, term()}.
 start(Callback) ->
   raft_server_sup:start_server(Callback).
+
+-spec stop(pid()) -> ok.
+stop(Server) ->
+  raft_server:stop(Server).
 
 -spec command(pid(), term()) ->
   ok.

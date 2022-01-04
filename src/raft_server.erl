@@ -14,9 +14,9 @@
 
 % election timeouts
 % erlang has monitors/links so do not really need timeouts, just in case.
--define(MAX_HEARTBEAT_TIMEOUT, 35000).
--define(MIN_HEARTBEAT_TIMEOUT, 15000).
--define(HEARTBEAT_GRACE_TIME, 5000).
+-define(MAX_HEARTBEAT_TIMEOUT, 3000).
+-define(MIN_HEARTBEAT_TIMEOUT, 2500).
+-define(HEARTBEAT_GRACE_TIME, 500).
 
 -define(ELECTION_TIMEOUT(Timeout), {state_timeout, Timeout, election_timeout}).
 -define(ELECTION_TIMEOUT, ?ELECTION_TIMEOUT(get_timeout())).
@@ -25,7 +25,10 @@
 -define(CLUSTER_CHANGE, '$raft_cluster_change').
 
 %% API
--export([start_link/1, status/1, command/2, join/2, leave/2]).
+-export([start_link/1, stop/1,
+         status/1,
+         command/2,
+         join/2, leave/2]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -48,9 +51,19 @@
   granted = 0 :: non_neg_integer()
 }).
 
+-record(active_request, {
+  log_index :: log_index(),
+  from :: gen_statem:from(),
+  majority :: pos_integer(),
+  pos = 0 :: non_neg_integer()
+}).
+
+-type(active_request() :: #active_request{}).
+
 -record(leader_state, {
   next_index = #{} :: #{pid() => log_index()},
-  match_index = #{} :: #{pid() => log_index()}
+  match_index = #{} :: #{pid() => log_index()},
+  active_requests = #{} :: #{log_index() => active_request()}
 }).
 
 -type(follower_state() :: #follower_state{}).
@@ -100,8 +113,10 @@
 -record(append_entries_resp, {
   term :: raft_term(),
   server :: pid(),
+  match_index :: log_index() | undefined,
   success :: boolean()
 }).
+
 -callback init() -> State when State :: term().
 
 -callback execute(Command, State) -> {reply, Reply, State} when
@@ -116,6 +131,10 @@
 -spec start_link(module()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(CallbackModule) ->
   gen_statem:start_link(?MODULE, CallbackModule, []).
+
+-spec stop(pid()) -> ok.
+stop(Server) ->
+  gen_statem:stop(Server).
 
 -spec status(pid()) -> {state_name(), term(), pid(), [pid()]}.
 status(ClusterMember) ->
@@ -194,8 +213,7 @@ handle_event(enter, _PrevStateName, candidate,
 
   % It then votes for itself and issues RequestVote RPCs in parallel to each of
   % the other servers in the cluster
-  erlang:send(Me, #vote_req_reply{term = NewTerm, granted = true
-  }),
+  send_msg(Me, #vote_req_reply{term = NewTerm, granted = true}),
   ?LOG("[~p, candidate] Send vote request for term ~p ~n", [self(), Term]),
   send(Cluster, VoteReq),
   InnerState = #candidate_state{majority = raft_cluster:majority_count(Cluster)},
@@ -221,8 +239,8 @@ handle_event(info, #vote_req_reply{term = Term, granted = false}, candidate,
              State = #state{current_term = CurrentTerm}) when Term > CurrentTerm ->
   ?LOG("[~p, candidate] Vote req reply has a higher term ~n", [self()]),
   {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
-handle_event(info, #vote_req_reply{granted = false}, candidate, State) ->
-  ?LOG("[~p, candidate] Got negative vote req reply ~n", [self()]),
+handle_event(info, #vote_req_reply{}, candidate, State) ->
+  ?LOG("[~p, candidate] Got vote req reply igonoring ~n", [self()]),
   {keep_state, State};
 handle_event(state_timeout, election_timeout, candidate, State) ->
   ?LOG("[~p, candidate] Election timeout ~p ~n", [self(), State]),
@@ -244,34 +262,51 @@ handle_event(state_timeout, election_timeout, candidate, State) ->
 % 4. Append any new entries not already in the log
 % 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 handle_event(info, #append_entries_req{term = Term, leader = Leader}, _StateName,
-             #state{current_term = CurrentTerm}) when Term < CurrentTerm ->
+             #state{current_term = CurrentTerm, log = Log}) when Term < CurrentTerm ->
   ?LOG("[~p, ~p] Got append_entries_req with lower term ~p, send false ~n",
        [self(), _StateName, {Term, CurrentTerm}]),
-  send_msg(Leader, #append_entries_resp{term = CurrentTerm, server = self(), success = false}),
+  send_msg(Leader, #append_entries_resp{term = CurrentTerm,
+                                        server = self(),
+                                        success = false,
+                                        % @TODO?!
+                                        match_index = raft_log:last_index(Log)}),
   keep_state_and_data;
 handle_event(info,
              #append_entries_req{prev_log_index = PrevLogIndex, leader = Leader, term = Term,
                                  leader_commit_index = LeaderCommitIndex} = AppendReq,
              _StateName,
-             #state{log = Log, current_term = Term, committed_index = CI} = State) ->
+             #state{log = Log, current_term = CurrentTerm, committed_index = CI} = State) ->
   print_record(AppendReq),
   case raft_log:get(Log, PrevLogIndex) of
-    {ok, {_Index, LogTerm, _Command}} when AppendReq#append_entries_req.term =/= LogTerm ->
+    {ok, {LogTerm, _Command}} when Term =/= LogTerm ->
       ?LOG("[~p, ~p] Got append_entries_req with different log term ~p, send false ~n",
            [self(), _StateName, {Term, LogTerm}]),
-      send_msg(Leader, #append_entries_resp{term = Term, server = self(), success = false}),
-      maybe_change_term(AppendReq, State);
+      send_msg(Leader, #append_entries_resp{term = CurrentTerm,
+                                            server = self(),
+                                            success = false,
+                                            match_index = 0}),
+      maybe_step_down_to_follower(AppendReq, State);
+    not_found when PrevLogIndex =/= 0->
+      ?LOG("[~p, ~p] Got append_entries_req previos log entry not found, send false ~n",
+           [self(), _StateName]),
+      send_msg(Leader, #append_entries_resp{term = CurrentTerm,
+                                            server = self(),
+                                            success = false,
+                                            match_index = 0}),
+      maybe_step_down_to_follower(AppendReq, State);
     _ ->
       NewLog = append_commands(AppendReq, Log),
       ?LOG("[~p, ~p] Got append_entries_req ~p send true~n", [self(), _StateName, Term]),
-      send_msg(Leader, #append_entries_resp{term = Term, server = self(), success = true}),
+      send_msg(Leader, #append_entries_resp{term = CurrentTerm,
+                                            match_index = raft_log:last_index(NewLog),
+                                            server = self(),
+                                            success = true}),
       ?LOG("[~p, ~p] maybe update ci ~p ~n", [self(), _StateName, {LeaderCommitIndex, CI,
                                                                    raft_log:last_index(NewLog)}]),
       NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CI, NewLog),
-      NewState = State#state{log = NewLog, current_term = Term, leader = Leader,
-                             committed_index = NewCommitIndex},
+      NewState = State#state{log = NewLog, committed_index = NewCommitIndex},
       print_record(NewState),
-      maybe_change_term(AppendReq, maybe_apply(NewState))
+      maybe_step_down_to_follower(AppendReq, maybe_apply(NewState))
   end;
 % handle vote requests
 % If votedFor is null or candidateId, and candidate’s log is at
@@ -282,24 +317,51 @@ handle_event(info, #vote_req{term = Term, candidate = Candidate}, _StateName,
        [self(), _StateName, Candidate]),
   send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = false}),
   {keep_state, State};
-handle_event(info, #vote_req{term = Term, candidate = Candidate}, _StateName,
-             #state{current_term = CurrentTerm} = State) when Term > CurrentTerm ->
-  ?LOG("[~p, ~p] Got vote req higher term thant current, reply positive ~p ~n",
-       [self(), _StateName, Candidate]),
-  send_msg(Candidate, #vote_req_reply{term = Term, granted = true}),
-  {next_state, follower, State#state{current_term = Term, voted_for = Candidate}};
-handle_event(info, #vote_req{candidate = Candidate}, _StateName,
-             #state{current_term = CurrentTerm, voted_for = undefined} = State) ->
-  ?LOG("[~p, ~p] Got vote req not_voted yet, reply positive ~p ~n",
-       [self(), _StateName, Candidate]),
-  send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
+handle_event(info, #vote_req{term = Term, candidate = Candidate,
+                             last_log_index = LastIndex, last_log_term = LastTerm}, _StateName,
+             #state{current_term = CurrentTerm, log = Log} = State) when Term > CurrentTerm ->
+  case {raft_log:last_index(Log), raft_log:last_term(Log)} of
+      {LastIndex, LastTerm} ->
+          % up-to-date log
+          ?LOG("[~p, ~p] Got vote req higher term thant current, reply positive ~p ~n",
+               [self(), _StateName, Candidate]),
+          send_msg(Candidate, #vote_req_reply{term = Term, granted = true}),
+          {next_state, follower, State#state{current_term = Term, voted_for = Candidate}};
+      _ ->
+?LOG("[~p, ~p] Got vote req higher term thant current, but log not up-to-date reply negative ~p ~n",
+               [self(), _StateName, Candidate]),
+          send_msg(Candidate, #vote_req_reply{term = Term, granted = false}),
+          {keep_state, follower, State#state{current_term = Term, voted_for = Candidate}}
+  end;
+handle_event(info, #vote_req{candidate = Candidate,
+                             last_log_term = LastTerm, last_log_index = LastIndex}, _StateName,
+             #state{current_term = CurrentTerm, voted_for = undefined, log = Log} = State) ->
+
+    case {raft_log:last_index(Log), raft_log:last_term(Log)} of
+        {LastIndex, LastTerm} ->
+            ?LOG("[~p, ~p] Got vote req not_voted yet, reply positive ~p ~n",
+                 [self(), _StateName, Candidate]),
+          send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true});
+        _ ->
+            ?LOG("[~p, ~p] Got vote req not_voted yet, but log not up-to-date reply negative ~p ~n",
+                 [self(), _StateName, Candidate]),
+            send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = false})
+    end,
   {keep_state, State#state{voted_for = Candidate}};
-handle_event(info, #vote_req{candidate = Candidate}, _StateName,
-             #state{current_term = CurrentTerm, voted_for = Candidate} = State) ->
-  ?LOG("[~p, ~p] Got vote req already voted for the same (~p), reply positive ~n",
-       [self(), _StateName, Candidate]),
-  send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true}),
-  {keep_state, State};
+handle_event(info, #vote_req{candidate = Candidate,
+                             last_log_index = LastIndex, last_log_term = LastTerm}, _StateName,
+             #state{current_term = CurrentTerm, voted_for = Candidate, log = Log} = State) ->
+    case {raft_log:last_index(Log), raft_log:last_term(Log)} of
+        {LastIndex, LastTerm} ->
+          ?LOG("[~p, ~p] Got vote req already voted for the same (~p), reply positive ~n",
+               [self(), _StateName, Candidate]),
+          send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = true});
+        _ ->
+?LOG("[~p, ~p] Got vote req already voted for the same (~p), but log not up-to-date reply negative ~n",
+ [self(), _StateName, Candidate]),
+            send_msg(Candidate, #vote_req_reply{term = CurrentTerm, granted = false})
+    end,
+   {keep_state, State};
 handle_event(info, #vote_req{candidate = Candidate}, _StateName,
              #state{current_term = CurrentTerm, voted_for = _OtherCandidate} = State) ->
   ?LOG("[~p, ~p] Got vote req already voted for the other candidate, reply negative ~p ~n",
@@ -309,7 +371,7 @@ handle_event(info, #vote_req{candidate = Candidate}, _StateName,
 
 handle_event({call, From}, status, StateName,
              #state{current_term = CurrentTerm, leader = Leader, cluster = Servers}) ->
-  gen_statem:reply(From, {StateName, CurrentTerm, Leader, [raft_cluster:members(Servers)]}),
+  gen_statem:reply(From, {StateName, CurrentTerm, Leader, raft_cluster:members(Servers)}),
   keep_state_and_data;
 
 %% %%%%%%%%%%%%%%%
@@ -317,12 +379,20 @@ handle_event({call, From}, status, StateName,
 %% %%%%%%%%%%%%%%%
 handle_event(enter, _PrevStateName, leader, #state{cluster = Cluster, log = Log} = State) ->
   ?LOG("[~p, leader] become leader~n", [self()]),
+
+  % @TODO refact? same as join
   NextIndex = raft_log:next_index(Log),
   Members = raft_cluster:members(Cluster),
 
+  SetMapFun = fun(CMembers, Value) ->
+                lists:foldl(fun(Member, Index) ->
+                                  Index#{Member => Value}
+                            end, #{}, CMembers)
+              end,
+
   LeaderState = #leader_state{
-    next_index = [#{Member => NextIndex} || Member <- Members],
-    match_index = [#{Member => 0} || Member <- Members]
+    next_index = SetMapFun(Members, NextIndex),
+    match_index = SetMapFun(Members, 0)
   },
 
   NewState = State#state{leader = self(), inner_state = LeaderState},
@@ -331,35 +401,58 @@ handle_event(enter, _PrevStateName, leader, #state{cluster = Cluster, log = Log}
   % (heartbeat) to each server; repeat during idle periods to
   % prevent election timeouts (§5.2)
   send_heartbeat(NewState),
-  {keep_state, NewState, [{state_timeout, get_min_timeout(), election_timeout}]};
+  {keep_state, NewState, [?ELECTION_TIMEOUT(get_min_timeout())]};
 handle_event(state_timeout, election_timeout, leader, State) ->
   send_heartbeat(State),
-  {keep_state_and_data, [{state_timeout, get_min_timeout(), election_timeout}]};
+  {keep_state_and_data, [?ELECTION_TIMEOUT(get_min_timeout())]};
 handle_event({call, From}, {command, Command}, leader, State) ->
-  {Result, NewState} = handle_command(Command, State),
-  gen_statem:reply(From, Result),
-  {keep_state, NewState};
+  {keep_state, handle_command(From, Command, State), [?ELECTION_TIMEOUT(get_min_timeout())]};
 handle_event({call, From}, {join, Server}, leader,
-             #state{cluster = Cluster} = State) ->
+             #state{cluster = Cluster, log = Log} = State) ->
   case raft_cluster:join(Server, Cluster) of
     {ok, NewCluster} ->
-      {Reply, NewState2} = handle_command({?CLUSTER_CHANGE, NewCluster}, State),
-      gen_statem:reply(From, Reply),
-      {keep_state, NewState2};
+      LeaderState = State#state.inner_state,
+      #leader_state{next_index = NextIndex, match_index = MatchIndex} = LeaderState,
+
+      NewLeaderState = #leader_state{
+        next_index = NextIndex#{Server => raft_log:next_index(Log)+1},
+        match_index = MatchIndex#{Server => raft_log:next_index(Log)}
+      },
+
+      NewState = State#state{inner_state = NewLeaderState},
+      {keep_state, handle_command(From, {?CLUSTER_CHANGE, NewCluster}, NewState)};
     {error, _} = Error ->
       gen_statem:reply(From, Error),
       keep_state_and_data
   end;
-handle_event({call, From}, {leave, Server}, leader, #state{cluster = Cluster} = State) ->
+handle_event({call, From}, {leave, Server}, leader,
+             #state{cluster = Cluster} = State) ->
   case raft_cluster:leave(Server, Cluster) of
     {ok, NewCluster} ->
-      {Reply, NewState2} = handle_command({?CLUSTER_CHANGE, NewCluster}, State),
-      gen_statem:reply(From, Reply),
-      {keep_state, NewState2};
+      LeaderState = State#state.inner_state,
+      #leader_state{next_index = NextIndex, match_index = MatchIndex} = LeaderState,
+
+      NewLeaderState = #leader_state{
+        next_index = maps:remove(Server, NextIndex),
+        match_index = maps:remove(Server, MatchIndex)
+      },
+
+      NewState = State#state{inner_state = NewLeaderState},
+      {keep_state, handle_command(From, {?CLUSTER_CHANGE, NewCluster}, NewState)};
     {error, _} = Error ->
       gen_statem:reply(From, Error),
       keep_state_and_data
   end;
+handle_event(info, #append_entries_resp{term = Term}, leader,
+        #state{current_term = CurrentTerm,
+               inner_state = #leader_state{active_requests = ActiveRequests}} = State)
+    when CurrentTerm < Term ->
+    maps:map(fun(_, #active_request{from = From}) ->
+                gen_statem:reply(From, {error, leader_changed})
+              end, ActiveRequests),
+    {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
+handle_event(info, #append_entries_resp{} = AppendEntriesReq, leader, State) ->
+    {keep_state, handle_append_entries(AppendEntriesReq, State)};
 
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
 %% Proxy commands to leader
@@ -401,9 +494,13 @@ handle_event(info, {proxy, Type, Context}, _StateName, #state{leader = Leader}) 
   gen_statem:cast(Leader, {proxy, Type, Context}),
   keep_state_and_data;
 
-% silence for unhandled now append_entries resp
-handle_event(info, #append_entries_resp{}, _StateName, _State) ->
-  keep_state_and_data;
+% not leader, can be dropped (check for newer term)
+handle_event(info, #append_entries_resp{term = Term}, StateName,
+             #state{current_term = CurrentTerm} = State) when StateName =/= leader andalso
+    CurrentTerm < Term ->
+    {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
+handle_event(info, #append_entries_resp{}, StateName, _State) when StateName =/= leader ->
+    keep_state_and_data;
 handle_event(info, #vote_req_reply{}, _StateName, _State) ->
   keep_state_and_data;
 
@@ -433,10 +530,10 @@ code_change(_OldVsn, StateName, State = #state{}, _Extra) ->
 %%%===================================================================
 send_heartbeat(State) ->
   print_record(State),
-  send_append_req([], State).
+  send_append_reqs([], State).
 
-send_append_req(Commands, #state{current_term = Term, log = Log,
-                                 cluster = Cluster, committed_index = CI}) ->
+send_append_reqs(Commands, #state{current_term = Term, log = Log,
+                                  cluster = Cluster, committed_index = CI}) ->
   ?LOG("[~p] send append log entries ~p~n", [self(), raft_cluster:members(Cluster)]),
   AppendEntriesReq = #append_entries_req{term = Term,
                                          leader = self(),
@@ -487,18 +584,19 @@ execute(Command, Index, #state{callback = CallbackModule, user_state = UserState
 send_msg(Target, Msg) ->
   erlang:send_nosuspend(Target, Msg).
 
-maybe_change_term(#append_entries_req{term = Term}, #state{current_term = CurrentTerm} = State)
+maybe_step_down_to_follower(#append_entries_req{term = Term, leader = Leader},
+                            #state{current_term = CurrentTerm} = State)
   when Term < CurrentTerm ->
-  {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
-maybe_change_term(_, State) ->
+  {next_state, follower, State#state{current_term = Term, voted_for = undefined, leader = Leader}};
+maybe_step_down_to_follower(_, State) ->
   {keep_state, State}.
 
 maybe_delete_log(Log, #append_entries_req{prev_log_index = PrevLogIndex, term = AppendTerm}) ->
   case raft_log:get(Log, PrevLogIndex) of
-    {ok, {Index, LogTerm, _Command}} when AppendTerm =/= LogTerm ->
+    {ok, {LogTerm, _Command}} when AppendTerm =/= LogTerm ->
       % 3. If an existing entry conflicts with a new one (same index
       % but different terms), delete the existing entry and all that follow it (§5.3)
-      raft_log:delete(Log, Index);
+      raft_log:delete(Log, PrevLogIndex);
     _ ->
       Log
   end.
@@ -516,55 +614,97 @@ maybe_update_commit_index(_LeaderCommitIndex, CommitIndex, _Log) ->
 
 maybe_apply(#state{last_applied = LastApplied, committed_index = CommittedIndex, log = Log} = State)
   when CommittedIndex > LastApplied ->
-  {ok, {Index, _Term, Command}} = raft_log:get(Log, raft_log:next_index(Log)),
-  {reply, _, NewState} = execute(Command, Index, State),
+  ?LOG("Committed index: ~p > LastApplied: ~p~n", [CommittedIndex, LastApplied]),
+  CurrentIndex = LastApplied+1,
+  {ok, {_Term, Command}} = raft_log:get(Log, CurrentIndex),
+  {reply, _, NewState} = execute(Command, CurrentIndex, State),
   maybe_apply(NewState);
 maybe_apply(State) ->
   State.
 
-wait_for_append_resp(Term, Cluster) ->
-  wait_for_append_resp(Term, raft_cluster:majority_count(Cluster), {0, 0}).
+has_majority(#active_request{majority = Majority, pos = Pos}) when Majority >= Pos ->
+    true;
+has_majority(_) ->
+    false.
 
-wait_for_append_resp(_Term, Majority, {Pos, _Neg}) when Majority >= Pos ->
-  replicated;
-wait_for_append_resp(_Term, Majority, {_Pos, Neg}) when Majority >= Neg ->
-  rejected;
-wait_for_append_resp(Term, Majority, {Pos, Neg}) ->
-  receive
-    #append_entries_resp{term = Term, success = true} ->
-      wait_for_append_resp(Term, Majority, {Pos+1, Neg});
-    #append_entries_resp{term = Term, success = false} ->
-      wait_for_append_resp(Term, Majority, {Pos, Neg+1})
-  % @ TODO monitor processes -> remove here
-  after 3000 ->
-    timeout
-  end.
-
-handle_command(Command, #state{log = Log, current_term = Term, cluster = Cluster} = State) ->
+handle_command(From, Command, #state{log = Log, current_term = Term, cluster = Cluster,
+                                     inner_state = #leader_state{active_requests = CurrentRequests} = LeaderState} = State) ->
   ?LOG("[~p, leader] command ~p~n", [self(),Command]),
   NewLog = raft_log:append(Log, Command, Term),
 
-  % send with old state (old log ref) to get last_term/last_index to previous
   ?LOG("[~p, leader] sending append entries to ~p~n", [self(), raft_cluster:members(Cluster)]),
-  send_append_req([Command], State),
+  % send with old state (old log ref) to get last_term/last_index to previous
+  send_append_reqs([Command], State),
+  LogIndex = raft_log:last_index(NewLog),
+  NewState = State#state{log = NewLog, committed_index = raft_log:last_index(NewLog)},
 
-  % @TODO: majority commit!?
-  ?LOG("[~p, leader] waiting replies~n", [self()]),
-  case wait_for_append_resp(Term, Cluster) of
-    replicated ->
-      ?LOG("[~p, leader] logs are successfully replicated~n", [self()]),
-      NewState = State#state{log = NewLog, committed_index = raft_log:last_index(NewLog)},
-      {reply, Reply, NewState2} = execute(Command, raft_log:last_index(NewLog), NewState),
-      % @TODO: this is not needed indeed
-      send_heartbeat(NewState2),
-      {Reply, NewState2};
-    rejected ->
-      ?LOG("[~p, leader] logs are UNsuccessfully replicated~n", [self()]),
-      {{error, rejected}, State};
-    timeout ->
-      ?LOG("[~p, leader] logs are UNsuccessfully replicated, due to timeout~n", [self()]),
-      {{error, timeout}, State}
+  case raft_cluster:majority_count(Cluster) of
+      1 -> %mean alone in the cluster
+          {reply, Reply, NewState2} = execute(Command, LogIndex, NewState),
+          gen_statem:reply(From, Reply),
+          NewState2;
+      MajorityCount ->
+          ActiveRequest = #active_request{log_index = LogIndex,
+                                          from = From,
+                                          pos = 1,
+                                          majority = MajorityCount},
+          NewState#state{inner_state =
+                      LeaderState#leader_state{
+                          active_requests = CurrentRequests#{LogIndex => ActiveRequest}
+                      }
+          }
   end.
+
+handle_append_entries(#append_entries_resp{term = _Term,
+                                           success = true,
+                                           server = Server,
+                                           match_index = MatchIndex},
+                     #state{inner_state =
+                         #leader_state{active_requests = ActiveRequests,
+                                       match_index = MatchIndexes} = InnerState
+                     } = State) ->
+    % update match_index
+    ?LOG("[~p, leader] got positive append_entries_resp from ~p with match_index: ~p~n",
+         [self(), Server, MatchIndex]),
+    NewMatchIndex = MatchIndexes#{Server => MatchIndex},
+    NewInnerState = InnerState#leader_state{match_index = NewMatchIndex},
+    case maps:get(MatchIndex, ActiveRequests, no_request) of
+        no_request ->
+            ?LOG("[~p, leader] no active request fround for ~p with match_index: ~p~n",
+                 [self(), Server, MatchIndex]),
+            State#state{inner_state = NewInnerState};
+        #active_request{pos = Pos} = ActiveRequest ->
+            ?LOG("[~p, leader] active request fround for ~p with match_index: ~p~n",
+                 [self(), Server, MatchIndex]),
+            % @TODO due to repeat process 1 request twice can cause issues?
+            NewActiveRequest = ActiveRequest#active_request{pos = Pos+1},
+            case has_majority(NewActiveRequest) of
+                true ->
+                    ?LOG("[~p, leader] ~p logs are successfully replicated~n",
+                         [self(), NewActiveRequest#active_request.log_index]),
+                    {ok, {_Term, Command}} = raft_log:get(State#state.log, MatchIndex),
+                    {reply, Reply, NewState} = execute(Command, MatchIndex, State),
+                    gen_statem:reply(NewActiveRequest#active_request.from, Reply),
+                    NewActiveRequests = maps:remove(MatchIndex, ActiveRequests),
+                    NewState#state{inner_state = NewInnerState#leader_state{active_requests = NewActiveRequests}};
+                _ ->
+                    ?LOG("[~p, leader] no majority has reach for the log replication ~p~n",
+                         [self(), MatchIndex]),
+                    NewActiveRequests = ActiveRequests#{MatchIndex => NewActiveRequest},
+                    State#state{inner_state = NewInnerState#leader_state{active_requests = NewActiveRequests}}
+            end
+    end;
+handle_append_entries(#append_entries_resp{term = _Term,
+                                           success = false,
+                                           server = Server},
+                      #state{inner_state =
+                        #leader_state{match_index = MatchIndexes} = InnerState
+                      } = State) ->
+    % update match_index
+    NewMatchIndex = MatchIndexes#{Server => maps:get(Server, MatchIndexes)-1},
+    ?LOG("[~p, leader] got negative append_rentries_resp, decrement match_index ~p~n",
+         [self(), NewMatchIndex]),
+    State#state{inner_state = InnerState#leader_state{match_index = NewMatchIndex}}.
 
 print_record(#append_entries_req{term = Term,
                                  leader = Leader,
@@ -579,25 +719,15 @@ print_record(#append_entries_req{term = Term,
         "prev_log_term = ~p~n" ++
         "entries = ~p~n" ++
         "leader_commit_index = ~p~n ~n",
-  io:format(user, Msg, [self(), Term, Leader, PLI, PLT, Entries, LCI]);
-
-%%  voted_for :: pid() | undefined,
-%%  log :: raft_log:log_ref(),
-%%
-%%  leader :: pid() | undefined,
-%%
-%%  committed_index = 0 :: log_index(),
-%%  last_applied = 0 :: log_index(),
-%%
-%%  inner_state :: follower_state() | candidate_state() | leader_state() | undefined
-
+  ?LOG(Msg, [self(), Term, Leader, PLI, PLT, Entries, LCI]);
 print_record(#state{current_term = CurrentTerm,
                     cluster = Cluster,
                     voted_for = VotedFor,
                     log = Log,
                     leader = Leader,
                     committed_index = CommittedIndex,
-                    last_applied = LastApplied}) ->
+                    last_applied = LastApplied,
+                    inner_state = InnerState}) ->
   Msg = "**** State [~p] ****~n" ++
         "term = ~p~n" ++
         "leader = ~p~n" ++
@@ -605,7 +735,8 @@ print_record(#state{current_term = CurrentTerm,
         "cluster members = ~p~n" ++
         "committed_index = ~p~n" ++
         "last_applied = ~p~n" ++
-        "log pos = ~p~n ~n",
-  io:format(user, Msg, [self(), CurrentTerm, Leader, VotedFor, raft_cluster:members(Cluster),
-                        CommittedIndex, LastApplied, {raft_log:last_index(Log),
-                                                      raft_log:last_term(Log)}]).
+        "log pos = last index: ~p, last_term: ~p~n" ++
+        "inner state = ~p~n ~n",
+  ?LOG(Msg, [self(), CurrentTerm, Leader, VotedFor, raft_cluster:members(Cluster),
+             CommittedIndex, LastApplied, raft_log:last_index(Log), raft_log:last_term(Log),
+             InnerState]).
