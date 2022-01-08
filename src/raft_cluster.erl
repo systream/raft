@@ -12,6 +12,7 @@
 
 -record(raft_cluster, {
     members = [] :: [pid()],
+    leader = undefined :: pid() | undefined,
     majority = 0 :: pos_integer()
     }).
 
@@ -20,11 +21,19 @@
 -export_type([cluster/0]).
 
 %% API
--export([leave/2, join/2, members/1, new/0, majority_count/1, member_count/1]).
+-export([leave/2, join/2, members/1, new/0, majority_count/1, member_count/1, leader/2, leader/1]).
 
 -spec new() -> cluster().
 new() ->
     update_majority(#raft_cluster{members = [self()]}).
+
+-spec leader(cluster()) -> pid() | undefined.
+leader(#raft_cluster{leader = Leader}) ->
+    Leader.
+
+-spec leader(cluster(), pid() | undefined) -> cluster().
+leader(Cluster, Leader) ->
+    Cluster#raft_cluster{leader = Leader}.
 
 -spec members(cluster()) -> [pid()].
 members(#raft_cluster{members = Members}) ->
@@ -44,7 +53,6 @@ join(Member, #raft_cluster{members = Members} = State) ->
         true ->
             {error, already_member};
         _ ->
-            ?LOG("[~p] Member added ~p~n", [self(), Member]),
             {ok, update_majority(State#raft_cluster{members = [Member | Members]})}
     end.
 
@@ -54,10 +62,8 @@ leave(Member, #raft_cluster{members = Members} = State) ->
         false ->
             {error, not_member};
         _ when Member =/= self() ->
-            ?LOG("[~p] Member removed ~p~n", [self(), Member]),
             {ok, update_majority(State#raft_cluster{members = lists:delete(Member, Members)})};
         _ when Member =:= self() ->
-            ?LOG("[~p] Member ramins alone in cluster ~p ~n", [self(), Member]),
             {ok, new()}
     end.
 

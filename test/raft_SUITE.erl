@@ -128,7 +128,9 @@ all() ->
 instant_leader_when_alone(_Config) ->
   {ok, Pid} = raft:start(raft_test_cb),
   wait_until_leader([Pid]),
-  ?assertMatch({leader, _, Pid, [Pid]}, raft:status(Pid)),
+  ?assertMatch(#{role := leader,
+                 leader := Pid,
+                 cluster_members := [Pid]}, raft:status(Pid)),
   raft:stop(Pid).
 
 command_alone(_Config) ->
@@ -190,7 +192,7 @@ new_leader(_Config) ->
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
   exit(Leader, kill),
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
-  {_, _, NewLeader, _} = raft:status(Slave2),
+  #{leader := NewLeader} = raft:status(Slave2),
   exit(NewLeader, kill),
   ct:pal("newl: ~p, old l: ~p Clueter: ~p", [NewLeader, Leader, [Slave2, Slave1]]),
   [LastNode] = [Slave1, Slave2] -- [NewLeader],
@@ -248,11 +250,11 @@ wait_until_leader(_Pids, 0) ->
   timeout;
 wait_until_leader([Pid | Rem] = Pids, Max) ->
   case raft:status(Pid) of
-    {leader, _Term, _Leader, _Members} when Pids =:= [Pid] ->
+    #{role := leader} when Pids =:= [Pid] ->
       ok;
-    {leader, _Term, _Leader, _Members} ->
+    #{role := leader} ->
       wait_until_leader(Rem ++ [Pid], Max);
-    {_Type, _Term, Leader, _Members} ->
+    #{leader := Leader} ->
       case lists:member(Leader, Pids) of
         true ->
           wait_until_leader(Rem, Max);
@@ -263,7 +265,9 @@ wait_until_leader([Pid | Rem] = Pids, Max) ->
   end.
 
 assert_status(Server, ExpectedState, ExpectedLeader, ExpectedClusterMembers) ->
-  {ServerState, _, Leader, ClusterMembers} = raft:status(Server),
+  #{role := ServerState,
+    leader := Leader,
+    cluster_members := ClusterMembers} = raft:status(Server),
   ?assertEqual(ExpectedState, ServerState),
   ?assertEqual(ExpectedLeader, Leader),
   ?assertEqual(lists:usort(ExpectedClusterMembers), lists:usort(ClusterMembers)).

@@ -1,9 +1,0 @@
-@startuml
-
-[*] --> follower
-follower -> candidate
-candidate -> follower
-candidate -> leader
-leader -> follower
-
-@enduml

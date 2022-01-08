@@ -21,13 +21,23 @@ test_mult() ->
   FirstPid.
 
 test_join() ->
+  logger:set_application_level(raft, debug),
   {ok, A} = start(raft_test_cb),
   {ok, B} = start(raft_test_cb),
-  timer:sleep(300),
+  {ok, C} = start(raft_test_cb),
+  {ok, D} = start(raft_test_cb),
+  {ok, E} = start(raft_test_cb),
   io:format(user, "========= started ===========~n~n", []),
   raft:join(A, B),
+  raft:join(A, C),
+  raft:join(A, D),
+  raft:join(A, E),
   print(status(A)),
-  print(status(B)).
+  print(status(B)),
+  print(status(C)),
+  print(status(D)),
+  print(status(E)),
+  [A, B, C].
 
 test() ->
   application:set_env(raft, max_heartbeat_timeout, 15000),
@@ -70,8 +80,8 @@ test() ->
   [print(status(Collaborator)) || Collaborator <- [A, B, C, D, E]],
   [A, B, C, D, E].
 
-print({Type, Term, Leader, Collaborators}) ->
-  io:format(user, "[~p,~p (~p)] -> ~p~n", [Leader, Type, Term, Collaborators]).
+print(Status) ->
+  io:format(user, "~p~n", [Status]).
 
 
 -spec start(module()) -> {ok, pid()} | {error, term()}.
@@ -95,6 +105,6 @@ join(ActualClusterMember, NewClusterMember) ->
 leave(ClusterMember, MemberToLeave) ->
   raft_server:leave(ClusterMember, MemberToLeave).
 
--spec status(pid()) -> {follower | candidate | leader, term(), pid(), [pid()]}.
+-spec status(pid()) -> map().
 status(ClusterMember) ->
   raft_server:status(ClusterMember).
