@@ -29,10 +29,10 @@ suite() ->
 %%--------------------------------------------------------------------
 init_per_suite(Config) ->
   {ok, _} = application:ensure_all_started(raft),
-  application:set_env(raft, max_heartbeat_timeout, 2500),
-  application:set_env(raft, min_heartbeat_timeout, 500),
-  application:set_env(raft, heartbeat_grace_time, 1000),
-  application:set_env(raft, consensus_timeout, 1000),
+  %application:set_env(raft, max_heartbeat_timeout, 2500),
+  %application:set_env(raft, min_heartbeat_timeout, 500),
+  %application:set_env(raft, heartbeat_grace_time, 300),
+  logger:set_primary_config(level, debug),
   Config.
 
 %%--------------------------------------------------------------------
@@ -97,11 +97,11 @@ end_per_testcase(_TestCase, _Config) ->
 groups() ->
   [
     {parallel_group, [parallel, shuffle],
-     [instant_leader_when_alone,
-      command_alone,
-      command_cluster
+     [%instant_leader_when_alone,
+      %command_alone,
+      %command_cluster,
       %join_cluster,
-      %new_leader,
+      new_leader
       %leave_join
     ]}
   ].
@@ -145,6 +145,8 @@ command_alone(_Config) ->
 command_cluster(_Config) ->
   {ok, PidA} = raft:start(raft_test_cb),
   {ok, PidB} = raft:start(raft_test_cb),
+  wait_until_leader([PidA]),
+  wait_until_leader([PidB]),
   ok = raft:join(PidA, PidB),
 
   ?assertEqual(2, raft:command(PidA, {store, test_before_leader_a, 2})),
@@ -170,6 +172,10 @@ join_cluster(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
   {ok, Slave1} = raft:start(raft_test_cb),
   {ok, Slave2} = raft:start(raft_test_cb),
+  wait_until_leader([Leader]),
+  wait_until_leader([Slave1]),
+  wait_until_leader([Slave2]),
+
   ok = raft:join(Leader, Slave1),
 
   assert_status(Leader, leader, Leader, [Slave1, Leader]),
@@ -187,6 +193,10 @@ new_leader(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
   {ok, Slave1} = raft:start(raft_test_cb),
   {ok, Slave2} = raft:start(raft_test_cb),
+  wait_until_leader([Leader]),
+  wait_until_leader([Slave1]),
+  wait_until_leader([Slave2]),
+
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
@@ -194,7 +204,7 @@ new_leader(_Config) ->
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
   #{leader := NewLeader} = raft:status(Slave2),
   exit(NewLeader, kill),
-  ct:pal("newl: ~p, old l: ~p Clueter: ~p", [NewLeader, Leader, [Slave2, Slave1]]),
+  ct:pal("newl: ~p, old l: ~p Cluster: ~p", [NewLeader, Leader, [Slave2, Slave1]]),
   [LastNode] = [Slave1, Slave2] -- [NewLeader],
   ?assertEqual(ok, wait_until_leader([LastNode])),
 

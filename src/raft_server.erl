@@ -15,8 +15,8 @@
 % election timeouts
 % erlang has monitors/links so do not really need timeouts, just in case.
 -define(MAX_HEARTBEAT_TIMEOUT, 10000).
--define(MIN_HEARTBEAT_TIMEOUT, 1500).
--define(HEARTBEAT_GRACE_TIME, 1500).
+-define(MIN_HEARTBEAT_TIMEOUT, 250).
+-define(HEARTBEAT_GRACE_TIME, 150).
 
 -define(ELECTION_TIMEOUT(Timeout), {state_timeout, Timeout, election_timeout}).
 -define(ELECTION_TIMEOUT, ?ELECTION_TIMEOUT(get_timeout())).
@@ -224,14 +224,14 @@ handle_event(enter, _PrevStateName, candidate,
   % It then votes for itself and issues RequestVote RPCs in parallel to each of
   % the other servers in the cluster
   send_msg(Me, #vote_req_reply{term = NewTerm, granted = true}),
-  logger:debug("Send vote request for term ~p", [Term]),
+  logger:debug("Send vote request for term ~p", [NewTerm]),
 
   [send_msg(Server, VoteReq) || Server <- raft_cluster:members(Cluster), Server =/= Me],
 
   NewState = State#state{current_term = NewTerm, inner_state = #candidate_state{},
                          cluster = raft_cluster:leader(Cluster, undefined),
-                         voted_for = undefined},
-  {keep_state, NewState, [?ELECTION_TIMEOUT]};
+                         voted_for = self()},
+  {keep_state, NewState, [?ELECTION_TIMEOUT(get_consensus_timeout())]};
 
 % process vote reply
 handle_event(info, #vote_req_reply{term = Term, granted = true}, candidate,
@@ -239,20 +239,21 @@ handle_event(info, #vote_req_reply{term = Term, granted = true}, candidate,
                     cluster = Cluster,
                     inner_state = InnerState = #candidate_state{granted = Granted}} = State) ->
   NewInnerState = InnerState#candidate_state{granted = Granted+1},
-  logger:debug("Got positive vote reply ~p", []),
+  logger:debug("Got positive vote reply for ~p term", [Term]),
   Majority = raft_cluster:majority_count(Cluster),
   case NewInnerState of
     #candidate_state{granted = Granted} when Granted < Majority ->
       {keep_state, State#state{inner_state = NewInnerState}};
     _ ->
-      logger:info("Have the majority of the votes", []),
+      logger:info("Have the majority of the votes from ~p term", [Term]),
       {next_state, leader, State#state{inner_state = NewInnerState}}
   end;
 handle_event(info, #vote_req_reply{term = Term, granted = false}, candidate,
-             State = #state{current_term = CurrentTerm}) when Term > CurrentTerm ->
+             #state{current_term = CurrentTerm} = State) when Term > CurrentTerm ->
   logger:notice("Vote request reply contains higher term", []),
   {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
-handle_event(info, #vote_req_reply{}, candidate, State) ->
+handle_event(info, #vote_req_reply{term = Term}, candidate,
+             #state{current_term = CurrentTerm} = State) when Term < CurrentTerm ->
   logger:notice("Vote request ignored", []),
   {keep_state, State};
 handle_event(state_timeout, election_timeout, candidate, State) ->
@@ -320,24 +321,22 @@ handle_event(info,
       {keep_state, State};
     _ ->
       NewLog = append_commands(AppendReq, Log),
-
-      NewState1 = State,
-      logger:debug("Got append_entries_req index, accepted", []),
+      logger:debug("Got append_entries_req ~p, accepted", [PrevLogIndex]),
       send_msg(Leader, #append_entries_resp{term = CurrentTerm,
                                             match_index = raft_log:last_index(NewLog),
                                             server = self(),
                                             success = true}),
 
       NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CI, NewLog),
-      NewState2 = NewState1#state{log = NewLog, committed_index = NewCommitIndex},
-      print_record(NewState2),
+      NewState = State#state{log = NewLog, committed_index = NewCommitIndex},
+      print_record(NewState),
       case AppendReq#append_entries_req.entries of
         [{?CLUSTER_CHANGE, NewCluster}] ->
-          apply_cluster_change(NewCluster, NewState2);
+          apply_cluster_change(NewCluster, NewState);
         _ ->
-          case maybe_apply(NewState2) of
-            {ok, NewState3} ->
-              {keep_state, NewState3, [?ELECTION_TIMEOUT]};
+          case maybe_apply(NewState) of
+            {ok, NewState1} ->
+              {keep_state, NewState1};
             {next_state, _NextStateName, _NewState4} = Result ->
               Result
           end
@@ -538,6 +537,15 @@ handle_event(info, #append_entries_resp{}, StateName, _State) when StateName =/=
 handle_event(info, #vote_req_reply{}, _StateName, _State) ->
   keep_state_and_data;
 
+handle_event(info, {'EXIT', Server, _Reason}, _StateName, #state{cluster = Cluster} = State) ->
+  % if the leader died, start new consensus
+  case Server =:= raft_cluster:leader(Cluster) of
+    true ->
+      logger:error("Cluster leader died", []),
+      {next_state, candidate, State};
+    _ ->
+      keep_state_and_data
+  end;
 handle_event(EventType, EventContent, StateName, #state{} = State) ->
   logger:warning("Unhandled event: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n",
                  [StateName, EventType, EventContent, State, StateName]),
@@ -572,10 +580,16 @@ send_append_reqs(#state{log = Log, inner_state = #leader_state{peers = Peers}}) 
 
 get_timeout() ->
   Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
+  %Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
+  GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
+  Rand = rand:uniform(GraceTime),
+  Max-Rand+GraceTime.
+
+get_consensus_timeout() ->
   Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
   GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
-  Rand = rand:uniform(Max-Min),
-  Min+Rand+GraceTime.
+  Rand = rand:uniform(GraceTime),
+  Min+Rand.
 
 get_min_timeout() ->
   application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT).
@@ -595,40 +609,18 @@ execute(Command, #state{callback = CallbackModule, user_state = UserState} = Sta
 apply_cluster_change(NewCluster, #state{cluster = CurrentCluster} = State) ->
   NewClusterMembers = raft_cluster:members(NewCluster),
   logger:info("Appling new cluster config ~p", [NewCluster]),
-  case lists:member(self(), NewClusterMembers) of
+  % @TODO unlink removed node?! or just ignore them when they die?
+  [link(C) || C <- NewClusterMembers, C =:= self()],
+  case raft_cluster:leader(NewCluster) =:= raft_cluster:leader(CurrentCluster) of
     true ->
-      % @TODO unlink removed node?! or just ignore them when they die?
-      [link(C) || C <- NewClusterMembers, C =:= self()],
-      case raft_cluster:leader(NewCluster) =:= raft_cluster:leader(CurrentCluster) of
-        true ->
-          {keep_state, State#state{cluster = NewCluster}};
-        _ ->
-          {next_state, follower, State#state{cluster = NewCluster}}
-      end;
-    false ->
-      % was new cluster leader member before out cluster? if not just ignore.
-      case lists:member(raft_cluster:leader(NewCluster), raft_cluster:members(CurrentCluster)) of
-        true ->
-          logger:info("Leaving the cluster", []),
-          {stop, leaving_cluster, State#state{cluster = raft_cluster:new()}};
-        false ->
-          logger:info("Ignoring cluster changes ~p", [NewCluster]),
-          {keep_state, State}
-      end
+      {keep_state, State#state{cluster = NewCluster}};
+    _ ->
+      {next_state, follower, State#state{cluster = NewCluster}}
   end.
 
 
 send_msg(Target, Msg) ->
   erlang:send_nosuspend(Target, Msg).
-
-maybe_step_down_to_follower(#append_entries_req{term = Term, leader = Leader},
-                            #state{current_term = CurrentTerm, cluster = Cluster} = State)
-  when Term > CurrentTerm ->
-  {next_state, follower, State#state{current_term = Term,
-                                     voted_for = undefined,
-                                     cluster = raft_cluster:leader(Cluster, Leader)}};
-maybe_step_down_to_follower(_, State) ->
-  {keep_state, State}.
 
 maybe_delete_log(Log, #append_entries_req{prev_log_index = PrevLogIndex, term = AppendTerm}) ->
   case raft_log:get(Log, PrevLogIndex) of
@@ -788,7 +780,7 @@ print_record(#append_entries_req{term = Term,
         "prev_log_term = ~p~n" ++
         "entries = ~p~n" ++
         "leader_commit_index = ~p~n ~n",
-  ?LOG(Msg, [self(), Term, Leader, PLI, PLT, Entries, LCI]);
+  logger:info(Msg, [self(), Term, Leader, PLI, PLT, Entries, LCI]);
 print_record(#append_entries_resp{term = Term,
                                  server = Server,
                                  match_index = MatchIndex,
@@ -798,7 +790,7 @@ print_record(#append_entries_resp{term = Term,
           "server = ~p~n" ++
           "match_index = ~p~n" ++
           "success = ~p~n ~n",
-    ?LOG(Msg, [self(), Term, Server, MatchIndex, Success]);
+  logger:info(Msg, [self(), Term, Server, MatchIndex, Success]);
 print_record(#state{current_term = CurrentTerm,
                     cluster = Cluster,
                     voted_for = VotedFor,
@@ -815,7 +807,7 @@ print_record(#state{current_term = CurrentTerm,
         "last_applied = ~p~n" ++
         "log pos = last index: ~p, last_term: ~p~n" ++
         "inner state = ~p~n ~n",
-  ?LOG(Msg, [self(), CurrentTerm, raft_cluster:leader(Cluster), VotedFor,
+  logger:info(Msg, [self(), CurrentTerm, raft_cluster:leader(Cluster), VotedFor,
              raft_cluster:members(Cluster), CommittedIndex, LastApplied,
              raft_log:last_index(Log), raft_log:last_term(Log),
              InnerState]).
