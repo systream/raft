@@ -3,11 +3,11 @@
 %% @end
 %%%-------------------------------------------------------------------
 
--module(raft_log_sup).
+-module(raft_server_sup).
 
 -behaviour(supervisor).
 
--export([start_link/0, start_worker/1, stop_worker/1]).
+-export([start_link/0, start_server/1]).
 
 -export([init/1]).
 
@@ -16,25 +16,21 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
--spec start_worker(proplists:proplist()) ->
+-spec start_server(CallbackModule :: module()) ->
   {ok, pid()} | {error, term()}.
-start_worker(Opts) ->
-  supervisor:start_child(?MODULE, [Opts]).
-
--spec stop_worker(pid()) -> ok | {error, term()}.
-stop_worker(Pid) ->
-  supervisor:terminate_child(?MODULE, Pid).
+start_server(CallbackModule) ->
+  supervisor:start_child(?MODULE, [CallbackModule]).
 
 init([]) ->
     SupFlags = #{strategy => simple_one_for_one,
                  intensity => 10,
                  period => 100},
-    ChildSpecs = [#{id => raft_log_worker,
-                    start => {raft_log_worker, start_link, []},
+    ChildSpecs = [#{id => raft_server,
+                    start => {raft_server, start_link, []},
                     restart => temporary,
                     shutdown => 5000,
                     type => worker,
-                    modules => [raft_log_worker]}
+                    modules => [raft_server]}
                  ],
     {ok, {SupFlags, ChildSpecs}}.
 

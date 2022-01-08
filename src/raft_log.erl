@@ -6,51 +6,74 @@
 %%%-------------------------------------------------------------------
 -module(raft_log).
 
--record(log_ref, {pid :: pid(),
-                  last_pos = 0 :: non_neg_integer()}).
+-include("raft.hrl").
+
+-define(INITIAL_TERM, 0).
+-define(INITIAL_INDEX, 0).
+
+-export([new/0,
+         append/3,
+         destroy/1,
+         last_index/1, last_term/1, get/2, delete/2, next_index/1]).
+
+-record(log_ref, {data_ref :: ets:tid(),
+                  last_index = ?INITIAL_INDEX :: log_index() | 0,
+                  last_term = ?INITIAL_TERM :: raft_term()}).
 
 -type(log_ref() :: #log_ref{}).
 
 -export_type([log_ref/0]).
 
--export([new/0, new/1,
-         append/2,
-         destroy/1,
-         stream/2, read_stream/2, get_pos/1, set_log_pos/2]).
+-record(log_entry, {
+    log_index :: log_index(),
+    term :: raft_term(),
+    command :: command()
+}).
 
 -spec new() -> log_ref().
 new() ->
-  new([]).
+  #log_ref{data_ref = ets:new(raft_log, [public, ordered_set, {keypos, 2}])}.
 
--spec new(Opt :: proplists:proplist()) -> log_ref().
-new(Opts) ->
-  {ok, Pid} = raft_log_sup:start_worker(Opts),
-  #log_ref{pid = Pid}.
-
--spec get_pos(log_ref()) -> non_neg_integer() | undefined.
-get_pos(#log_ref{last_pos = Pos}) ->
+-spec last_index(log_ref()) -> log_index().
+last_index(#log_ref{last_index = Pos}) ->
   Pos.
 
--spec set_log_pos(log_ref(), non_neg_integer() | undefined) -> log_ref().
-set_log_pos(Log = #log_ref{}, Pos) ->
-  Log#log_ref{last_pos = Pos}.
+-spec last_term(log_ref()) -> raft_term().
+last_term(#log_ref{last_term = Term}) ->
+  Term.
 
--spec append(term(), log_ref()) -> log_ref().
-append(Command, #log_ref{pid = Pid, last_pos = Pos} = Ref) ->
-  {ok, NewPos} = raft_log_worker:append(Pid, Pos, Command),
-  Ref#log_ref{last_pos = NewPos}.
+-spec append(log_ref(), command(), raft_term()) -> log_ref().
+append(#log_ref{data_ref = Ref} = LogRef, Command, Term) ->
+  NewPos = next_index(LogRef),
+  ets:insert(Ref, #log_entry{log_index = NewPos, term = Term, command = Command}),
+  LogRef#log_ref{last_index = NewPos, last_term = Term}.
 
--spec stream(log_ref(), pid()) -> {ok, term()} | {error, term()}.
-stream(#log_ref{pid = Pid, last_pos = undefined}, TargetPid) ->
-  raft_log_worker:stream(Pid, TargetPid, first);
-stream(#log_ref{pid = Pid, last_pos = Pos}, TargetPid) ->
-  raft_log_worker:stream(Pid, TargetPid, Pos).
+-spec get(log_ref(), log_index()) -> {ok, {raft_term(), command()}} | not_found.
+get(#log_ref{data_ref = Ref}, Index) ->
+  case ets:lookup(Ref, Index) of
+      [] ->
+          not_found;
+      [#log_entry{log_index = Index, term = Term, command = Command}] ->
+          {ok, {Term, Command}}
+  end.
 
--spec read_stream(term(), non_neg_integer() | infinity) ->
-  {ok, non_neg_integer(), term()} | '$end_of_stream' | timeout.
-read_stream(StreamRef, Timeout) ->
-  raft_log_worker:read_stream(StreamRef, Timeout).
+-spec next_index(log_ref()) -> log_index().
+next_index(#log_ref{last_index = LastIndex}) ->
+    LastIndex+1.
 
--spec destroy(log_ref()) -> ok | {error, term()}.
-destroy(#log_ref{pid = Pid}) ->
-  raft_log_sup:stop_worker(Pid).
+-spec delete(log_ref(), log_index()) -> log_ref().
+delete(#log_ref{data_ref = Ref, last_index = LastIndex} = LogRef, Index) when LastIndex >= Index ->
+    ets:delete(Ref, LastIndex),
+    delete(LogRef#log_ref{last_index = LastIndex-1}, Index);
+delete(#log_ref{last_index = LastIndex} = LogRef, _Index) ->
+    case get(LogRef, LastIndex) of
+        {ok, {LastTerm, _LastCommand}} ->
+            LogRef#log_ref{last_term = LastTerm};
+        not_found when LastIndex =:= ?INITIAL_INDEX ->
+            LogRef#log_ref{last_term = ?INITIAL_TERM}
+    end.
+
+-spec destroy(log_ref()) -> ok.
+destroy(#log_ref{data_ref = Ref}) ->
+  ets:delete(Ref),
+  ok.

@@ -66,7 +66,7 @@ end_per_group(_GroupName, _Config) ->
 %% Reason = term()
 %%--------------------------------------------------------------------
 init_per_testcase(_TestCase, Config) ->
-  [{ref, raft_log:new([{retention_time, 60}])} | Config].
+  Config.
 
 %%--------------------------------------------------------------------
 %% Function: end_per_testcase(TestCase, Config0) ->
@@ -75,8 +75,7 @@ init_per_testcase(_TestCase, Config) ->
 %% Config0 = Config1 = [tuple()]
 %% Reason = term()
 %%--------------------------------------------------------------------
-end_per_testcase(_TestCase, Config) ->
-  raft_log:destroy(?config(ref, Config)),
+end_per_testcase(_TestCase, _Config) ->
   ok.
 
 %%--------------------------------------------------------------------
@@ -102,12 +101,14 @@ groups() ->
 %% Reason = term()
 %%--------------------------------------------------------------------
 all() ->
-  [ stream_empty,
+  [ last_entries_new_log,
     append_log,
-    out_of_range,
-    overwrite,
-    retention_time,
-    retention_time_not_enough_token
+    append_log_overwrite,
+    log_not_found,
+    next_index,
+    delete,
+    delete_unknown,
+    destroy
   ].
 
 %%--------------------------------------------------------------------
@@ -118,108 +119,55 @@ all() ->
 %% Reason = term()
 %% Comment = term()
 %%--------------------------------------------------------------------
-stream_empty(Config) ->
-  LogRef = ?config(ref, Config),
-  {ok, Data} = wait_for_log_stream(raft_log:stream(LogRef, self()), []),
-  ?assertEqual([], Data).
+last_entries_new_log(_Config) ->
+  LogRef = raft_log:new(),
+  ?assertEqual(0, raft_log:last_index(LogRef)),
+  ?assertEqual(0, raft_log:last_term(LogRef)).
 
-append_log(Config) ->
-  Log = ?config(ref, Config),
-  Log1 = raft_log:append(<<"test data">>, Log),
-  Log2 = raft_log:append(<<"test data2">>, Log1),
+append_log(_Config) ->
+  LogRef = raft_log:new(),
+  LogRef2 = raft_log:append(LogRef, test_command, 5),
+  ?assertEqual(1, raft_log:last_index(LogRef2)),
+  ?assertEqual(5, raft_log:last_term(LogRef2)).
 
-  % From the begining
-  {ok, Data} = wait_for_log_stream(raft_log:stream(Log, self()), []),
-  ?assertEqual([{2,  <<"test data2">>}, {1, <<"test data">>}], Data),
+append_log_overwrite(_Config) ->
+  LogRef = raft_log:new(),
+  _LogRef2 = raft_log:append(LogRef, test_command, 5),
+  LogRef3 = raft_log:append(LogRef, test_command2, 6),
+  ?assertEqual(1, raft_log:last_index(LogRef3)),
+  ?assertEqual(6, raft_log:last_term(LogRef3)),
+  ?assertEqual({ok, {6, test_command2}}, raft_log:get(LogRef3, 1)).
 
-  % at the end
-  {ok, Data2} = wait_for_log_stream(raft_log:stream(Log2, self()), []),
-  ?assertEqual([], Data2).
+log_not_found(_Config) ->
+  LogRef = raft_log:new(),
+  ?assertEqual(not_found, raft_log:get(LogRef, 100)).
 
-out_of_range(Config) ->
-  {log_ref, Pid, _LogPos} = Log = ?config(ref, Config),
-  _NewLog = lists:foldl(fun raft_log:append/2, Log, lists:seq(1, 10)),
+next_index(_Config) ->
+  LogRef = raft_log:new(),
+  ?assertEqual(1, raft_log:next_index(LogRef)),
+  LogRef2 = raft_log:append(LogRef, test_command, 1),
+  ?assertEqual(2, raft_log:next_index(LogRef2)).
 
-  LogOverLast = {log_ref, Pid, 10000},
-  LogOverFirst = {log_ref, Pid, -10},
+delete(_Config) ->
+  LogRef = raft_log:new(),
+  Entries = 10,
+  LogRef2 = lists:foldl(fun(I, LRef) ->
+                          raft_log:append(LRef, {test, I}, 1)
+                        end, LogRef, lists:seq(1, Entries)),
 
-  ?assertEqual({error, {bad_log_pos, 10000, {1, 10}}}, raft_log:stream(LogOverLast, self())),
+  Index = 5,
+  ?assertEqual({ok, {1, {test, Index}}}, raft_log:get(LogRef2, Index)),
+  LogRef3 = raft_log:delete(LogRef2, 5),
 
-  % auto fallback for first known item
-  ?assertMatch({ok, _}, raft_log:stream(LogOverFirst, self())).
+  ?assertEqual(not_found, raft_log:get(LogRef3, Index)),
+  ?assertEqual(not_found, raft_log:get(LogRef3, Index+1)),
+  ?assertEqual({ok, {1, {test, Index-1}}}, raft_log:get(LogRef3, Index-1)).
 
-overwrite(Config) ->
-  Log = ?config(ref, Config),
-  _LogTen = lists:foldl(fun raft_log:append/2, Log, lists:seq(1, 10)),
-  NewLog2 = raft_log:append("test_1", Log),
-  NewLog3 = raft_log:append("test_2", NewLog2),
-  NewLog4 = raft_log:append("test_3", NewLog3),
-  {ok, Data1} = wait_for_log_stream(raft_log:stream(NewLog2, self()), []),
-  {ok, Data2} = wait_for_log_stream(raft_log:stream(NewLog4, self()), []),
-  ?assertEqual([{3, "test_3"}, {2, "test_2"}], Data1),
-  ?assertEqual([], Data2),
+delete_unknown(_Config) ->
+  LogRef = raft_log:new(),
+  LogRef2 = raft_log:delete(LogRef, 10),
+  ?assertEqual(0, raft_log:last_index(LogRef2)).
 
-  NewLog4 = raft_log:append("test_3_1", NewLog3),
-  {ok, Data3} = wait_for_log_stream(raft_log:stream(NewLog2, self()), []),
-  {ok, Data4} = wait_for_log_stream(raft_log:stream(NewLog4, self()), []),
-  ?assertEqual([{3, "test_3_1"}, {2, "test_2"}], Data3),
-  ?assertEqual([], Data4).
-
-retention_time(_Config) ->
-  Log = raft_log:new([{retention_time, 1}]),
-  LogTen = lists:foldl(fun raft_log:append/2, Log, lists:seq(1, 100)),
-
-  % wait the retention to kick in
-  timer:sleep(2005),
-
-  {log_ref, Pid, _LogPos} = Log,
-  SendAllRef = {log_ref, Pid, undefined},
-
-  {ok, Data1} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
-  ?assertEqual([], Data1),
-
-  NewLog2 = raft_log:append("test_1", LogTen),
-  {ok, Data2} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
-  ?assertEqual([{101, "test_1"}], Data2),
-
-  {ok, Data3} = wait_for_log_stream(raft_log:stream(NewLog2, self()), []),
-  ?assertEqual([], Data3),
-
-  timer:sleep(2005),
-  _NewLog3 = raft_log:append("test_1", NewLog2),
-
-  % fallback for first item
-  {ok, _}  = wait_for_log_stream(raft_log:stream(Log, self()), []),
-
-  {ok, Data4} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
-  ?assertEqual([{102, "test_1"}], Data4).
-
-
-retention_time_not_enough_token(_Config) ->
-  Log = raft_log:new([{retention_time, 1}]),
-  _LogTen = lists:foldl(fun raft_log:append/2, Log, lists:seq(1, 250)),
-  % wait the retention to kick in
-  timer:sleep(2005),
-
-  {log_ref, Pid, _LogPos} = Log,
-  SendAllRef = {log_ref, Pid, undefined},
-  {ok, Data1} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
-  ?assertEqual(lists:reverse([{I, I} || I <- lists:seq(101, 250)]), Data1),
-
-  timer:sleep(1005),
-  {ok, Data2} = wait_for_log_stream(raft_log:stream(SendAllRef, self()), []),
-  ?assertEqual(lists:reverse([{I, I} || I <- lists:seq(201, 250)]), Data2).
-
-wait_for_log_stream({error, Error}, _Acc) ->
-  {error, Error};
-wait_for_log_stream({ok, StreamRef}, Acc) ->
-  wait_for_log_stream(StreamRef, Acc);
-wait_for_log_stream(StreamRef, Acc) ->
-  case raft_log:read_stream(StreamRef, 1200) of
-    {ok, Pos, Data} ->
-      wait_for_log_stream(StreamRef, [{Pos, Data} | Acc]);
-    '$end_of_stream' ->
-      {ok, Acc};
-    timeout ->
-      timeout
-  end.
+destroy(_Config) ->
+  LogRef = raft_log:new(),
+  ?assertEqual(ok, raft_log:destroy(LogRef)).

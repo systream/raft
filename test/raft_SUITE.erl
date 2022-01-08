@@ -98,12 +98,11 @@ groups() ->
   [
     {parallel_group, [parallel, shuffle],
      [instant_leader_when_alone,
-      join_cluster,
-      new_leader,
-      leave_join,
-      catch_up_after_join,
-      catch_up_slave_is_ahead,
-      catch_up_after_rejoin
+      command_alone,
+      command_cluster
+      %join_cluster,
+      %new_leader,
+      %leave_join
     ]}
   ].
 
@@ -129,19 +128,60 @@ all() ->
 instant_leader_when_alone(_Config) ->
   {ok, Pid} = raft:start(raft_test_cb),
   wait_until_leader([Pid]),
-  ?assertMatch({leader, _, Pid, [Pid]}, raft:status(Pid)).
+  ?assertMatch(#{role := leader,
+                 leader := Pid,
+                 cluster_members := [Pid]}, raft:status(Pid)),
+  raft:stop(Pid).
+
+command_alone(_Config) ->
+  {ok, Pid} = raft:start(raft_test_cb),
+  ?assertEqual(2, raft:command(Pid, {store, test_before_leader, 2})),
+  ?assertEqual(2, raft:command(Pid, {get, test_before_leader})),
+  wait_until_leader([Pid]),
+  ?assertEqual(1, raft:command(Pid, {store, test, 1})),
+  ?assertEqual(1, raft:command(Pid, {get, test})),
+  raft:stop(Pid).
+
+command_cluster(_Config) ->
+  {ok, PidA} = raft:start(raft_test_cb),
+  {ok, PidB} = raft:start(raft_test_cb),
+  ok = raft:join(PidA, PidB),
+
+  ?assertEqual(2, raft:command(PidA, {store, test_before_leader_a, 2})),
+  ?assertEqual(2, raft:command(PidA, {get, test_before_leader_a})),
+  ?assertEqual(2, raft:command(PidB, {store, test_before_leader_b, 2})),
+  ?assertEqual(2, raft:command(PidB, {get, test_before_leader_b})),
+  wait_until_leader([PidA, PidB]),
+  ?assertEqual(1, raft:command(PidA, {store, test_a, 1})),
+  ?assertEqual(1, raft:command(PidA, {get, test_a})),
+  ?assertEqual(1, raft:command(PidB, {store, test_b, 1})),
+  ?assertEqual(1, raft:command(PidB, {get, test_b})),
+
+  ?assertEqual(1, raft:command(PidA, {store, test_ab, 1})),
+  ?assertEqual(1, raft:command(PidB, {get, test_ab})),
+
+  ?assertEqual(1, raft:command(PidB, {store, test_ba, 1})),
+  ?assertEqual(1, raft:command(PidA, {get, test_ba})),
+
+  raft:stop(PidA),
+  raft:stop(PidB).
 
 join_cluster(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
   {ok, Slave1} = raft:start(raft_test_cb),
   {ok, Slave2} = raft:start(raft_test_cb),
   ok = raft:join(Leader, Slave1),
-  ?assertMatch({leader, _, Leader, [Leader, Slave1]}, raft:status(Leader)),
+
+  assert_status(Leader, leader, Leader, [Slave1, Leader]),
 
   ok = raft:join(Leader, Slave2),
-  ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
-  ?assertMatch({follower, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Slave1)),
-  ?assertMatch({follower, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Slave2)).
+  assert_status(Leader, leader, Leader, [Slave1, Slave2, Leader]),
+  assert_status(Slave1, follower, Leader, [Slave1, Slave2, Leader]),
+  assert_status(Slave2, follower, Leader, [Slave1, Slave2, Leader]),
+
+  raft:stop(Leader),
+  raft:stop(Slave1),
+  raft:stop(Slave2).
 
 new_leader(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
@@ -149,14 +189,18 @@ new_leader(_Config) ->
   {ok, Slave2} = raft:start(raft_test_cb),
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
-  ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
   exit(Leader, kill),
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
-  {_, _, NewLeader, _} = raft:status(Slave2),
+  #{leader := NewLeader} = raft:status(Slave2),
   exit(NewLeader, kill),
   ct:pal("newl: ~p, old l: ~p Clueter: ~p", [NewLeader, Leader, [Slave2, Slave1]]),
   [LastNode] = [Slave1, Slave2] -- [NewLeader],
-  ?assertEqual(ok, wait_until_leader([LastNode])).
+  ?assertEqual(ok, wait_until_leader([LastNode])),
+
+  raft:stop(Leader),
+  raft:stop(Slave1),
+  raft:stop(Slave2).
 
 leave_join(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
@@ -164,102 +208,38 @@ leave_join(_Config) ->
   {ok, Slave2} = raft:start(raft_test_cb),
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
-  ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
+
   io:format(user, "~n** Cluster formed! **~n", []),
 
   ok = raft:leave(Leader, Slave1),
-  ?assertMatch({leader, _, Leader, [Leader, Slave2]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader, Slave2]),
   io:format(user, "~n** Slave1 leaved! **~n", []),
 
   ok = raft:leave(Slave2, Leader),
   io:format(user, "~n** Slave2 called to leave leader leaved! **~n", []),
   wait_until_leader([Leader]),
-  ?assertMatch({leader, _, Leader, [Leader]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader]),
 
   io:format(user, "~n** leader leaved! **~n", []),
 
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
-  ?assertMatch({leader, _, Leader, [Leader, Slave1, Slave2]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
 
   io:format(user, "~n** Cluster re formed! **~n", []),
 
   ok = raft:leave(Slave2, Leader),
   io:format(user, "~n** Leader asked to leve by Slave2! **~n", []),
   wait_until_leader([Leader]),
-  ?assertMatch({leader, _, Leader, [Leader]}, raft:status(Leader)),
+  assert_status(Leader, leader, Leader, [Leader]),
   io:format(user, "~n** Slave 2 leaved! **~n", []),
 
-  ?assertEqual(ok, wait_until_leader([Slave1, Slave2])).
+  ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
 
-catch_up_after_join(_Config) ->
-  {ok, Leader} = raft:start(raft_test_cb),
-  {ok, Slave1} = raft:start(raft_test_cb),
-
-  Counter = raft:command(Leader, {store, test, 1}),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  ok = raft:join(Leader, Slave1),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
-  timer:sleep(100),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  % kill the leader to transfer leadership to Slave1 and get the data
-  exit(Leader, kill),
-  wait_until_leader([Slave1]),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
-
-catch_up_slave_is_ahead(_Config) ->
-  {ok, Leader} = raft:start(raft_test_cb),
-  {ok, Slave1} = raft:start(raft_test_cb),
-
-  Counter = raft:command(Leader, {store, test, 1}),
-  _ = raft:command(Slave1, {store, test, 1}),
-  _ = raft:command(Slave1, {store, test, 2}),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  ok = raft:join(Leader, Slave1),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
-  timer:sleep(100),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  % kill the leader to transfer leadership to Slave1 and get the data
-  exit(Leader, kill),
-  wait_until_leader([Slave1]),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
-
-
-catch_up_after_rejoin(_Config) ->
-  {ok, Leader} = raft:start(raft_test_cb),
-  {ok, Slave1} = raft:start(raft_test_cb),
-
-  _ = raft:command(Leader, {store, test, 1}),
-  _ = raft:command(Slave1, {store, test, 1}),
-  _ = raft:command(Slave1, {store, test, 2}),
-  Counter = raft:command(Leader, {store, test, 1}),
-
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  ok = raft:join(Leader, Slave1),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
-  timer:sleep(100),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  ok = raft:leave(Leader, Slave1),
-  timer:sleep(100),
-  ?assertEqual(0, raft:command(Slave1, {get, test})),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  ok = raft:join(Leader, Slave1),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})),
-  timer:sleep(100),
-  ?assertEqual(Counter, raft:command(Leader, {get, test})),
-
-  % kill the leader to transfer leadership to Slave1 and get the data
-  exit(Leader, kill),
-  wait_until_leader([Slave1]),
-  ?assertEqual(Counter, raft:command(Slave1, {get, test})).
-
+  raft:stop(Leader),
+  raft:stop(Slave1),
+  raft:stop(Slave2).
 
 wait_until_leader(Pids) ->
   wait_until_leader(Pids, 2500).
@@ -270,11 +250,11 @@ wait_until_leader(_Pids, 0) ->
   timeout;
 wait_until_leader([Pid | Rem] = Pids, Max) ->
   case raft:status(Pid) of
-    {leader, _Term, _Leader, _Members} when Pids =:= [Pid] ->
+    #{role := leader} when Pids =:= [Pid] ->
       ok;
-    {leader, _Term, _Leader, _Members} ->
+    #{role := leader} ->
       wait_until_leader(Rem ++ [Pid], Max);
-    {_Type, _Term, Leader, _Members} ->
+    #{leader := Leader} ->
       case lists:member(Leader, Pids) of
         true ->
           wait_until_leader(Rem, Max);
@@ -283,3 +263,11 @@ wait_until_leader([Pid | Rem] = Pids, Max) ->
           wait_until_leader(Pids, Max-1)
       end
   end.
+
+assert_status(Server, ExpectedState, ExpectedLeader, ExpectedClusterMembers) ->
+  #{role := ServerState,
+    leader := Leader,
+    cluster_members := ClusterMembers} = raft:status(Server),
+  ?assertEqual(ExpectedState, ServerState),
+  ?assertEqual(ExpectedLeader, Leader),
+  ?assertEqual(lists:usort(ExpectedClusterMembers), lists:usort(ClusterMembers)).

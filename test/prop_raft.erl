@@ -28,9 +28,8 @@ status([]) ->
   ok;
 status([Pid | Tail]) ->
   case raft:status(Pid) of
-    {Type, Term, Leader, Collaborators} ->
-      io:format(user, "[~p - ~p[~p]] Leader: ~p~nCollaborators: ~p~n",
-                [Pid, Type, Term, Leader, Collaborators]);
+    Status ->
+      io:format(user, "[~p] -> ~p~n", [Pid, Status]);
     _ ->
       io:format(user, "[~p] procs died~n", [Pid])
   end,
