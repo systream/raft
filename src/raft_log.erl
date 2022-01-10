@@ -45,6 +45,7 @@ last_term(#log_ref{last_term = Term}) ->
 -spec append(log_ref(), command(), raft_term()) -> log_ref().
 append(#log_ref{data_ref = Ref} = LogRef, Command, Term) ->
   NewPos = next_index(LogRef),
+  logger:debug("Storing log entry on index ~p with term ~p command ~p", [NewPos, Term, Command]),
   ets:insert(Ref, #log_entry{log_index = NewPos, term = Term, command = Command}),
   LogRef#log_ref{last_index = NewPos, last_term = Term}.
 

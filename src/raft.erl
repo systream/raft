@@ -21,14 +21,19 @@ test_mult() ->
   FirstPid.
 
 test_join() ->
-  logger:set_application_level(raft, debug),
+  %logger:set_application_level(raft, debug),
+  logger:set_primary_config(level, info),
   {ok, A} = start(raft_test_cb),
   {ok, B} = start(raft_test_cb),
   {ok, C} = start(raft_test_cb),
   %{ok, D} = start(raft_test_cb),
   %{ok, E} = start(raft_test_cb),
+  timer:sleep(100),
   io:format(user, "========= started ===========~n~n", []),
   raft:join(A, B),
+  %raft:join(A, E),
+  %raft:join(A, D),
+
   raft:command(A, {store,  test, 1}),
   raft:command(B, {store,  test, 1}),
   raft:join(A, C),
@@ -36,7 +41,7 @@ test_join() ->
   %raft:join(A, E),
   print(status(A)),
   print(status(B)),
-  print(status(C)),
+  %print(status(C)),
   %print(status(D)),
   %print(status(E)),
   [A, B, C].

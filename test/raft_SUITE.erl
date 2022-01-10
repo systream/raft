@@ -19,7 +19,7 @@
 %% Info = [tuple()]
 %%--------------------------------------------------------------------
 suite() ->
-  [{timetrap, {seconds, 30}}].
+  [{timetrap, {seconds, 10}}].
 
 %%--------------------------------------------------------------------
 %% Function: init_per_suite(Config0) ->
@@ -100,8 +100,8 @@ groups() ->
      [%instant_leader_when_alone,
       %command_alone,
       %command_cluster,
-      %join_cluster,
-      new_leader
+      join_cluster
+      %new_leader,
       %leave_join
     ]}
   ].
@@ -177,10 +177,10 @@ join_cluster(_Config) ->
   wait_until_leader([Slave2]),
 
   ok = raft:join(Leader, Slave1),
-
   assert_status(Leader, leader, Leader, [Slave1, Leader]),
 
   ok = raft:join(Leader, Slave2),
+  io:format(user, "Status ~p", [raft:status(Slave2)]),
   assert_status(Leader, leader, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave1, follower, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave2, follower, Leader, [Slave1, Slave2, Leader]),
@@ -216,6 +216,10 @@ leave_join(_Config) ->
   {ok, Leader} = raft:start(raft_test_cb),
   {ok, Slave1} = raft:start(raft_test_cb),
   {ok, Slave2} = raft:start(raft_test_cb),
+  wait_until_leader([Leader]),
+  wait_until_leader([Slave1]),
+  wait_until_leader([Slave2]),
+
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),

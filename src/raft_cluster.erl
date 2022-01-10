@@ -21,7 +21,7 @@
 -export_type([cluster/0]).
 
 %% API
--export([leave/2, join/2, members/1, new/0, majority_count/1, member_count/1, leader/2, leader/1]).
+-export([leave/2, join/2, members/1, new/0, majority_count/1, member_count/1, leader/2, leader/1, joint_cluster/2]).
 
 -spec new() -> cluster().
 new() ->
@@ -30,6 +30,12 @@ new() ->
 -spec leader(cluster()) -> pid() | undefined.
 leader(#raft_cluster{leader = Leader}) ->
     Leader.
+
+-spec joint_cluster(cluster(), cluster()) -> cluster().
+joint_cluster(#raft_cluster{members = CurrentClusterMembers} = Cluster,
+              #raft_cluster{members = NewClusterMembers}) ->
+  JointClusterMembers = lists:usort(CurrentClusterMembers ++ NewClusterMembers),
+  update_majority(Cluster#raft_cluster{members = JointClusterMembers}).
 
 -spec leader(cluster(), pid() | undefined) -> cluster().
 leader(Cluster, Leader) ->
