@@ -16,7 +16,7 @@
   %log :: raft_log:log_ref(),
   next_index = 1 :: log_index(),
   match_index = 0 :: log_index() | 0
-  %in_flight_msgs
+  %in_flight_requests
 }).
 
 -type(peer() :: #raft_peer{}).

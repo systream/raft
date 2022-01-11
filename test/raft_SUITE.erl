@@ -19,7 +19,7 @@
 %% Info = [tuple()]
 %%--------------------------------------------------------------------
 suite() ->
-  [{timetrap, {seconds, 10}}].
+  [{timetrap, {seconds, 30}}].
 
 %%--------------------------------------------------------------------
 %% Function: init_per_suite(Config0) ->
@@ -29,9 +29,9 @@ suite() ->
 %%--------------------------------------------------------------------
 init_per_suite(Config) ->
   {ok, _} = application:ensure_all_started(raft),
-  %application:set_env(raft, max_heartbeat_timeout, 2500),
-  %application:set_env(raft, min_heartbeat_timeout, 500),
-  %application:set_env(raft, heartbeat_grace_time, 300),
+  application:set_env(raft, max_heartbeat_timeout, 500),
+  application:set_env(raft, min_heartbeat_timeout, 100),
+  application:set_env(raft, heartbeat_grace_time, 50),
   logger:set_primary_config(level, debug),
   Config.
 
@@ -100,9 +100,9 @@ groups() ->
      [%instant_leader_when_alone,
       %command_alone,
       %command_cluster,
-      join_cluster
+      %join_cluster,
       %new_leader,
-      %leave_join
+      leave_join
     ]}
   ].
 
@@ -177,10 +177,13 @@ join_cluster(_Config) ->
   wait_until_leader([Slave2]),
 
   ok = raft:join(Leader, Slave1),
+  timer:sleep(10),
+
   assert_status(Leader, leader, Leader, [Slave1, Leader]),
 
   ok = raft:join(Leader, Slave2),
-  io:format(user, "Status ~p", [raft:status(Slave2)]),
+  % need to wait a bit to slave2 catch up,
+  timer:sleep(10),
   assert_status(Leader, leader, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave1, follower, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave2, follower, Leader, [Slave1, Slave2, Leader]),
@@ -200,15 +203,18 @@ new_leader(_Config) ->
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
+  timer:sleep(10),
   exit(Leader, kill),
+
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
   #{leader := NewLeader} = raft:status(Slave2),
-  exit(NewLeader, kill),
-  ct:pal("newl: ~p, old l: ~p Cluster: ~p", [NewLeader, Leader, [Slave2, Slave1]]),
-  [LastNode] = [Slave1, Slave2] -- [NewLeader],
-  ?assertEqual(ok, wait_until_leader([LastNode])),
 
-  raft:stop(Leader),
+  % check able to remove dead node:
+  ok = raft:leave(NewLeader, Leader),
+  timer:sleep(100),
+
+  assert_status(NewLeader, leader, NewLeader, [Slave1, Slave2]),
+
   raft:stop(Slave1),
   raft:stop(Slave2).
 
@@ -222,32 +228,30 @@ leave_join(_Config) ->
 
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
+  timer:sleep(10),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
 
-  io:format(user, "~n** Cluster formed! **~n", []),
-
   ok = raft:leave(Leader, Slave1),
+  timer:sleep(10),
   assert_status(Leader, leader, Leader, [Leader, Slave2]),
-  io:format(user, "~n** Slave1 leaved! **~n", []),
-
-  ok = raft:leave(Slave2, Leader),
-  io:format(user, "~n** Slave2 called to leave leader leaved! **~n", []),
+  ok = raft:leave(Slave2, Leader), % left leader alone
+  timer:sleep(600), % need to wait for the election timeout
   wait_until_leader([Leader]),
   assert_status(Leader, leader, Leader, [Leader]),
 
-  io:format(user, "~n** leader leaved! **~n", []),
-
+  io:format(user, "status ~p ~n", [raft:status(Leader)]),
   ok = raft:join(Leader, Slave1),
   ok = raft:join(Leader, Slave2),
+  timer:sleep(600),  % need to wait for the election timeout
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
-
-  io:format(user, "~n** Cluster re formed! **~n", []),
-
   ok = raft:leave(Slave2, Leader),
   io:format(user, "~n** Leader asked to leve by Slave2! **~n", []),
+  timer:sleep(600), % need to wait for the election timeout
+  io:format(user, "Leader, ~p ~n", [raft:status(Leader)]),
   wait_until_leader([Leader]),
   assert_status(Leader, leader, Leader, [Leader]),
   io:format(user, "~n** Slave 2 leaved! **~n", []),
+  timer:sleep(10),
 
   ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
 

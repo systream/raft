@@ -28,7 +28,7 @@ init([]) ->
     ChildSpecs = [#{id => raft_server,
                     start => {raft_server, start_link, []},
                     restart => temporary,
-                    shutdown => 5000,
+                    shutdown => 15000,
                     type => worker,
                     modules => [raft_server]}
                  ],
