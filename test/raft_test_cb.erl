@@ -11,19 +11,19 @@
 -behavior(raft_server).
 
 %% API
--export([init/0, execute/2]).
+-export([init/0, handle_command/2]).
 
 
 -spec init() -> State when State :: term().
 init() ->
   #{}.
 
--spec execute(Command, State) -> {reply, Reply, State} when
+-spec handle_command(Command, State) -> {reply, Reply, State} when
   Command :: term(),
   State :: term(),
   Reply :: term().
-execute({store, Key, Value}, State) ->
+handle_command({store, Key, Value}, State) ->
   NewValue = maps:get(Key, State, 0)+Value,
-  {reply, NewValue, State#{Key => NewValue}};
-execute({get, Key}, State) ->
+  {reply, {ok, NewValue}, State#{Key => NewValue}};
+handle_command({get, Key}, State) ->
   {reply, maps:get(Key, State, 0), State}.

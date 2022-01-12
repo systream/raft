@@ -29,9 +29,9 @@ status([]) ->
 status([Pid | Tail]) ->
   case raft:status(Pid) of
     Status ->
-      io:format(user, "[~p] -> ~p~n", [Pid, Status]);
-    _ ->
-      io:format(user, "[~p] procs died~n", [Pid])
+      io:format(user, "[~p] -> ~p~n", [Pid, Status])%;
+    %_ ->
+    %  io:format(user, "[~p] procs died~n", [Pid])
   end,
   status(Tail).
 
@@ -88,7 +88,7 @@ postcondition(#state{storage = _Storage} = _State,
               {call, raft, command, [_On, {store, _Key, _Value}]}, {error, _}) ->
   true;
 postcondition(#state{storage = Storage, in_cluster = InCluster} = _State,
-              {call, raft, command, [On, {store, Key, Value}]}, StoreValue) ->
+              {call, raft, command, [On, {store, Key, Value}]}, {ok, StoreValue}) ->
   StorageGet = maps:get(Key, Storage, 0),
   io:format(user, "Get ~p increase ~p => ~p (~p)~n", [Key, Value, StoreValue, StorageGet]),
   case lists:member(On, InCluster) of
@@ -105,6 +105,8 @@ postcondition(#state{storage = Storage, in_cluster = InCluster} = _State,
       true
   end;
 postcondition(_State, {call, raft, join, [_On, _Target]}, ok) ->
+  true;
+postcondition(_State, {call, raft, join, [_On, _Target]}, {error, already_member}) ->
   true;
 postcondition(_State, {call, raft, leave, [_On, _Target]}, ok) ->
   true;

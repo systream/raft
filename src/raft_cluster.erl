@@ -21,25 +21,41 @@
 -export_type([cluster/0]).
 
 %% API
--export([leave/2, join/2, members/1, new/0, majority_count/1, member_count/1, leader/2, leader/1, joint_cluster/2]).
+-export([new/0,
+         leave/2, join/2,
+         members/1, is_member/2,
+         majority_count/1, member_count/1,
+         leader/2, leader/1,
+         joint_cluster/2]).
 
 -spec new() -> cluster().
 new() ->
     update_majority(#raft_cluster{members = [self()]}).
 
+-spec is_member(pid(), cluster()) -> boolean().
+is_member(Member, #raft_cluster{members = Members}) ->
+    lists:member(Member, Members).
+
 -spec leader(cluster()) -> pid() | undefined.
 leader(#raft_cluster{leader = Leader}) ->
     Leader.
+
+-spec leader(cluster(), pid() | undefined) -> cluster().
+leader(Cluster, undefined) ->
+  Cluster#raft_cluster{leader = undefined};
+leader(Cluster, Leader) ->
+  case is_member(Leader, Cluster) of
+    true ->
+      Cluster#raft_cluster{leader = Leader};
+    false -> % @todo this may be can be deleted
+      throw({leader_must_be_cluster_member, Leader, members(Cluster)})
+  end.
 
 -spec joint_cluster(cluster(), cluster()) -> cluster().
 joint_cluster(#raft_cluster{members = CurrentClusterMembers} = Cluster,
               #raft_cluster{members = NewClusterMembers}) ->
   JointClusterMembers = lists:usort(CurrentClusterMembers ++ NewClusterMembers),
   update_majority(Cluster#raft_cluster{members = JointClusterMembers}).
-
--spec leader(cluster(), pid() | undefined) -> cluster().
-leader(Cluster, Leader) ->
-    Cluster#raft_cluster{leader = Leader}.
 
 -spec members(cluster()) -> [pid()].
 members(#raft_cluster{members = Members}) ->
