@@ -108,7 +108,8 @@ all() ->
     next_index,
     delete,
     delete_unknown,
-    destroy
+    destroy,
+    append_commands
   ].
 
 %%--------------------------------------------------------------------
@@ -171,3 +172,34 @@ delete_unknown(_Config) ->
 destroy(_Config) ->
   LogRef = raft_log:new(),
   ?assertEqual(ok, raft_log:destroy(LogRef)).
+
+append_commands(_Config) ->
+  LogRef = raft_log:new(),
+  Command = fun (I) -> {store, test, I} end,
+  NewLogRef = raft_log:append_commands(LogRef, [{1, Command(1)}, {1, Command(2)}], 1),
+  ?assertEqual(2, raft_log:last_index(NewLogRef)),
+  ?assertEqual(1, raft_log:last_term(NewLogRef)),
+
+  % do not append command when already set
+  NewLogRef2 = raft_log:append_commands(NewLogRef, [{1, Command(1)},
+                                                    {1, Command(2)},
+                                                    {2, Command(3)}],
+                                        1),
+  ?assertEqual(3, raft_log:last_index(NewLogRef2)),
+  ?assertEqual(2, raft_log:last_term(NewLogRef2)),
+  ?assertEqual({ok, 3, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)}]}, raft_log:list(NewLogRef2, 1, 100)),
+
+  NewLogRef3 = raft_log:append_commands(NewLogRef2, [{2, Command(4)}],
+                                        4),
+
+  ?assertEqual(4, raft_log:last_index(NewLogRef3)),
+  ?assertEqual(2, raft_log:last_term(NewLogRef3)),
+  ?assertEqual({ok, 4, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)},
+                        {2, Command(4)}]}, raft_log:list(NewLogRef3, 1, 100)),
+  ?assertEqual({ok, 3, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)}]}, raft_log:list(NewLogRef3, 1, 2)).

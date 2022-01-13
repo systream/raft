@@ -57,8 +57,10 @@ append(#log_ref{data_ref = Ref, last_term = LastTerm} = LogRef, Command, Term) -
 append_commands(LogRef, [], _NextIndex) ->
   LogRef;
 append_commands(#log_ref{last_index = LastIndex} = Log, [{Term, Command} | RestCommands], Index) ->
-  case LastIndex > Index of
+  case LastIndex >= Index of
     true ->
+      % @todo reduce see raft_peer todo
+      logger:debug("Skip storing (already stored): ~p ", [Index]),
       append_commands(Log, RestCommands, Index+1);
     false ->
       append_commands(append(Log, Command, Term), RestCommands, Index+1)
@@ -90,10 +92,12 @@ get(#log_ref{data_ref = Ref}, Index) ->
   end.
 
 -spec list(log_ref(), log_index(), pos_integer()) ->
-  list({term(), command()}).
-list(#log_ref{last_index = LastIndex} = Log, FromIndex, MaxChunk) ->
-  EndIndex = min(FromIndex + MaxChunk, LastIndex),
-  get_list(Log, EndIndex, FromIndex, []).
+  {ok, log_index(), list({term(), command()})}.
+list(#log_ref{last_index = LastIndex} = Log, FromIndex, MaxChunk) when FromIndex =< LastIndex ->
+  EndIndex = min(FromIndex+MaxChunk, LastIndex),
+  {ok, EndIndex, get_list(Log, EndIndex, FromIndex, [])};
+list(#log_ref{last_index = LastIndex}, _FromIndex, _MaxChunk) ->
+  {ok, LastIndex, []}.
 
 -spec get_list(log_ref(), log_index(), log_index(), list({term(), command()})) ->
   list({term(), command()}).

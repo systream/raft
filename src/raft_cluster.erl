@@ -80,14 +80,19 @@ join(Member, #raft_cluster{members = Members} = State) ->
 
 -spec leave(pid(), cluster()) -> cluster().
 leave(Member, #raft_cluster{members = Members} = State) ->
-    case lists:member(Member, Members) of
-        false ->
-            {error, not_member};
-        _ when Member =/= self() ->
-            {ok, update_majority(State#raft_cluster{members = lists:delete(Member, Members)})};
-        _ when Member =:= self() ->
-            {ok, new()}
-    end.
+  case lists:member(Member, Members) of
+    false ->
+      {error, not_member};
+    _ ->
+      NewCluster = update_majority(State#raft_cluster{members = lists:delete(Member, Members)}),
+      NewCluster2 = case Member =:= leader(NewCluster) of
+                      true ->
+                        leader(NewCluster, undefined);
+                      _ ->
+                        NewCluster
+                    end,
+      {ok, NewCluster2}
+  end.
 
 -spec member_count(cluster()) -> pos_integer().
 member_count(#raft_cluster{members = Members}) ->
