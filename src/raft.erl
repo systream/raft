@@ -11,39 +11,7 @@
 -export([start/1, stop/1,
          join/2, leave/2,
          status/1,
-         command/2,
-
-         test_join/0]).
-
-test_join() ->
-  logger:set_application_level(raft, debug),
-  logger:set_primary_config(level, debug),
-  {ok, A} = start(raft_test_cb),
-  {ok, B} = start(raft_test_cb),
-  {ok, C} = start(raft_test_cb),
-  {ok, D} = start(raft_test_cb),
-  {ok, E} = start(raft_test_cb),
-  timer:sleep(100),
-  io:format(user, "========= started ===========~n~n", []),
-  raft:join(A, B),
-  raft:join(A, E),
-  raft:join(A, D),
-
-  raft:command(A, {store,  test, 1}),
-  raft:command(B, {store,  test, 1}),
-  raft:join(A, C),
-  raft:join(A, D),
-  raft:join(A, E),
-  print(status(A)),
-  print(status(B)),
-  print(status(C)),
-  print(status(D)),
-  print(status(E)),
-  [A, B, C, D, E].
-
-print(Status) ->
-  io:format(user, "~p~n", [Status]).
-
+         command/2, query/2]).
 
 -spec start(module()) -> {ok, pid()} | {error, term()}.
 start(Callback) ->
@@ -58,11 +26,17 @@ stop(Server) ->
 command(ClusterMember, Command) ->
   raft_server:command(ClusterMember, Command).
 
--spec join(pid(), pid()) -> ok.
+
+-spec query(pid(), term()) ->
+  term().
+query(ClusterMember, Command) ->
+  raft_server:query(ClusterMember, Command).
+
+-spec join(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 join(ActualClusterMember, NewClusterMember) ->
   raft_server:join(ActualClusterMember, NewClusterMember).
 
--spec leave(pid(), pid()) -> ok.
+-spec leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 leave(ClusterMember, MemberToLeave) ->
   raft_server:leave(ClusterMember, MemberToLeave).
 

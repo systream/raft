@@ -24,6 +24,15 @@ init() ->
   Reply :: term().
 handle_command({store, Key, Value}, State) ->
   NewValue = maps:get(Key, State, 0)+Value,
+  {reply, {ok, NewValue}, State#{Key => NewValue}};
+handle_command(noop, State) ->
+  {reply, ok, State};
+handle_command({sleep, Time}, State) ->
+  timer:sleep(Time),
+  {reply, ok, State};
+handle_command({hash, Key, Value}, State) ->
+  CValue = maps:get(Key, State, 0),
+  NewValue = erlang:phash2(<<CValue/integer, (term_to_binary(Value))/binary>>),
   {reply, {ok, NewValue}, State#{Key => NewValue}}.
 
 -spec handle_query(Command, State) -> {reply, Reply, State} when

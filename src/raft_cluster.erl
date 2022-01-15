@@ -30,15 +30,15 @@
 
 -spec new() -> cluster().
 new() ->
-    update_majority(#raft_cluster{members = [self()]}).
+  #raft_cluster{members = [self()], majority = 1}.
 
 -spec is_member(pid(), cluster()) -> boolean().
 is_member(Member, #raft_cluster{members = Members}) ->
-    lists:member(Member, Members).
+  lists:member(Member, Members).
 
 -spec leader(cluster()) -> pid() | undefined.
 leader(#raft_cluster{leader = Leader}) ->
-    Leader.
+  Leader.
 
 -spec leader(cluster(), pid() | undefined) -> cluster().
 leader(Cluster, undefined) ->
@@ -48,7 +48,8 @@ leader(Cluster, Leader) ->
     true ->
       Cluster#raft_cluster{leader = Leader};
     false -> % @todo this may be can be deleted
-      throw({leader_must_be_cluster_member, Leader, members(Cluster)})
+      Cluster#raft_cluster{leader = undefined}%;
+      %throw({leader_must_be_cluster_member, Leader, members(Cluster)})
   end.
 
 -spec joint_cluster(cluster(), cluster()) -> cluster().
@@ -63,22 +64,22 @@ members(#raft_cluster{members = Members}) ->
 
 -spec majority_count(cluster()) -> pos_integer().
 majority_count(#raft_cluster{majority = Majority}) ->
-    Majority.
+  Majority.
 
 -spec update_majority(cluster()) -> cluster().
 update_majority(Cluster) ->
-    Cluster#raft_cluster{majority = (member_count(Cluster) div 2) + 1}.
+  Cluster#raft_cluster{majority = (member_count(Cluster) div 2) + 1}.
 
--spec join(pid(), cluster()) -> {ok, cluster()}.
+-spec join(pid(), cluster()) -> {ok, cluster()} | {error, already_member}.
 join(Member, #raft_cluster{members = Members} = State) ->
-    case lists:member(Member, Members) of
-        true ->
-            {error, already_member};
-        _ ->
-            {ok, update_majority(State#raft_cluster{members = [Member | Members]})}
-    end.
+  case lists:member(Member, Members) of
+    true ->
+      {error, already_member};
+    _ ->
+      {ok, update_majority(State#raft_cluster{members = [Member | Members]})}
+  end.
 
--spec leave(pid(), cluster()) -> cluster().
+-spec leave(pid(), cluster()) -> {ok, cluster()} | {error, not_member}.
 leave(Member, #raft_cluster{members = Members} = State) ->
   case lists:member(Member, Members) of
     false ->
