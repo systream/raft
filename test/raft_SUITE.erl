@@ -97,12 +97,12 @@ end_per_testcase(_TestCase, _Config) ->
 groups() ->
   [
     {parallel_group, [parallel, shuffle],
-     [%instant_leader_when_alone,
-      %command_alone,
-      %command_cluster,
-      %join_cluster,
-      %new_leader,
-      leave_join
+     [instant_leader_when_alone
+      ,command_alone
+      ,command_cluster
+      ,join_cluster
+      ,new_leader
+      %leave_join
     ]}
   ].
 
@@ -135,11 +135,11 @@ instant_leader_when_alone(_Config) ->
 
 command_alone(_Config) ->
   {ok, Pid} = raft:start(raft_test_cb),
-  ?assertEqual({ok, 2}, raft:command(Pid, {store, test_before_leader, 2})),
-  ?assertEqual(2, raft:command(Pid, {get, test_before_leader})),
+  ?assertEqual({error, no_leader}, raft:command(Pid, {store, test_before_leader, 2})),
+  ?assertEqual({error, no_leader}, raft:query(Pid, {get, test_before_leader})),
   wait_until_leader([Pid]),
   ?assertEqual({ok, 1}, raft:command(Pid, {store, test, 1})),
-  ?assertEqual(1, raft:command(Pid, {get, test})),
+  ?assertEqual(1, raft:query(Pid, {get, test})),
   raft:stop(Pid).
 
 command_cluster(_Config) ->
@@ -150,20 +150,20 @@ command_cluster(_Config) ->
   ok = raft:join(PidA, PidB),
 
   ?assertEqual({ok, 2}, raft:command(PidA, {store, test_before_leader_a, 2})),
-  ?assertEqual(2, raft:command(PidA, {get, test_before_leader_a})),
+  ?assertEqual(2, raft:query(PidA, {get, test_before_leader_a})),
   ?assertEqual({ok, 2}, raft:command(PidB, {store, test_before_leader_b, 2})),
-  ?assertEqual(2, raft:command(PidB, {get, test_before_leader_b})),
+  ?assertEqual(2, raft:query(PidB, {get, test_before_leader_b})),
   wait_until_leader([PidA, PidB]),
   ?assertEqual({ok, 1}, raft:command(PidA, {store, test_a, 1})),
-  ?assertEqual(1, raft:command(PidA, {get, test_a})),
+  ?assertEqual(1, raft:query(PidA, {get, test_a})),
   ?assertEqual({ok, 1}, raft:command(PidB, {store, test_b, 1})),
-  ?assertEqual(1, raft:command(PidB, {get, test_b})),
+  ?assertEqual(1, raft:query(PidB, {get, test_b})),
 
   ?assertEqual({ok, 1}, raft:command(PidA, {store, test_ab, 1})),
-  ?assertEqual(1, raft:command(PidB, {get, test_ab})),
+  ?assertEqual(1, raft:query(PidB, {get, test_ab})),
 
   ?assertEqual({ok, 1}, raft:command(PidB, {store, test_ba, 1})),
-  ?assertEqual({ok, 1}, raft:command(PidA, {get, test_ba})),
+  ?assertEqual(1, raft:query(PidA, {get, test_ba})),
 
   raft:stop(PidA),
   raft:stop(PidB).
@@ -200,20 +200,15 @@ new_leader(_Config) ->
   wait_until_leader([Slave1]),
   wait_until_leader([Slave2]),
 
-  ok = raft:join(Leader, Slave1),
-  ok = raft:join(Leader, Slave2),
+  ok = retry_until({raft, join, [Leader, Slave1]}, 30),
+  ok = retry_until({raft, join, [Leader, Slave2]}, 30),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
-  timer:sleep(10),
   exit(Leader, kill),
-
-  ?assertEqual(ok, wait_until_leader([Slave1, Slave2])),
-  #{leader := NewLeader} = raft:status(Slave2),
+  % need some time to realise that the leader has died
+  timer:sleep(15),
 
   % check able to remove dead node:
-  ok = raft:leave(NewLeader, Leader),
-  timer:sleep(100),
-
-  assert_status(NewLeader, leader, NewLeader, [Slave1, Slave2]),
+  ok = retry_until({raft, leave, [Slave1, Leader]}, 30),
 
   raft:stop(Slave1),
   raft:stop(Slave2).
@@ -226,13 +221,13 @@ leave_join(_Config) ->
   wait_until_leader([Slave1]),
   wait_until_leader([Slave2]),
 
-  ok = raft:join(Leader, Slave1),
-  ok = raft:join(Leader, Slave2),
+  ok = retry_until({raft, join, [Leader, Slave1]}, 10),
+  ok = retry_until({raft, join, [Leader, Slave2]}, 10),
   assert_status(Leader, leader, Leader, [Leader, Slave1, Slave2]),
 
-  ok = raft:leave(Leader, Slave1),
+  ok = retry_until({raft, leave, [Leader, Slave1]}, 100),
   assert_status(Leader, leader, Leader, [Leader, Slave2]),
-  ok = raft:leave(Slave2, Leader), % left leader alone
+  ok = retry_until({raft, leave, [Slave2, Leader]}, 100), % left leader alone
   wait_until_leader([Leader]),
   io:format(user, "status ~p ~n", [raft:status(Leader)]),
   assert_status(Leader, leader, Leader, [Leader]),
@@ -279,6 +274,7 @@ wait_until_leader([Pid | Rem] = Pids, Max) ->
         true ->
           wait_until_leader(Rem, Max);
         _ ->
+          [ct:pal("S: ~p", [raft:status(Pid2)]) || Pid2 <- Pids],
           timer:sleep(10),
           wait_until_leader(Pids, Max-1)
       end
@@ -291,3 +287,16 @@ assert_status(Server, ExpectedState, ExpectedLeader, ExpectedClusterMembers) ->
   ?assertEqual(ExpectedState, ServerState),
   ?assertEqual(ExpectedLeader, Leader),
   ?assertEqual(lists:usort(ExpectedClusterMembers), lists:usort(ClusterMembers)).
+
+
+retry_until(MFA) ->
+  retry_until(MFA, 10).
+
+retry_until({M, F, A} = MFA, Times) ->
+  case apply(M, F, A) of
+    {error, no_leader} when Times > 0 ->
+      timer:sleep(100),
+      retry_until(MFA, Times-1);
+    Else ->
+      Else
+  end.

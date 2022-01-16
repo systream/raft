@@ -71,8 +71,6 @@ append_commands(LogRef, [], _NextIndex) ->
 append_commands(#log_ref{last_index = LastIndex} = Log, [{Term, Command} | RestCommands], Index) ->
   case LastIndex >= Index of
     true ->
-      % @todo reduce see raft_peer todo
-      logger:debug("Skip storing (already stored): ~p ", [Index]),
       append_commands(Log, RestCommands, Index+1);
     false ->
       append_commands(append(Log, Command, Term), RestCommands, Index+1)

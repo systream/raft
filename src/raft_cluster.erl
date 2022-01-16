@@ -47,9 +47,8 @@ leader(Cluster, Leader) ->
   case is_member(Leader, Cluster) of
     true ->
       Cluster#raft_cluster{leader = Leader};
-    false -> % @todo this may be can be deleted
-      Cluster#raft_cluster{leader = undefined}%;
-      %throw({leader_must_be_cluster_member, Leader, members(Cluster)})
+    false ->
+      Cluster#raft_cluster{leader = undefined}
   end.
 
 -spec joint_cluster(cluster(), cluster()) -> cluster().
@@ -79,11 +78,14 @@ join(Member, #raft_cluster{members = Members} = State) ->
       {ok, update_majority(State#raft_cluster{members = [Member | Members]})}
   end.
 
--spec leave(pid(), cluster()) -> {ok, cluster()} | {error, not_member}.
+-spec leave(pid(), cluster()) ->
+  {ok, cluster()} | {error, not_member | last_member_in_the_cluster}.
 leave(Member, #raft_cluster{members = Members} = State) ->
   case lists:member(Member, Members) of
     false ->
       {error, not_member};
+    _ when Members =:= [Member] ->
+      {error, last_member_in_the_cluster};
     _ ->
       NewCluster = update_majority(State#raft_cluster{members = lists:delete(Member, Members)}),
       NewCluster2 = case Member =:= leader(NewCluster) of

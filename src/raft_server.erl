@@ -59,8 +59,8 @@
 -type(active_request() :: #request{}).
 
 -record(leader_state, {
-    peers = #{} :: #{pid() => raft_peer:peer()},
-    active_requests = #{} :: #{log_index() => active_request()}
+  peers = #{} :: #{pid() => raft_peer:peer()},
+  active_requests = #{} :: #{log_index() => active_request()}
 }).
 
 -type(follower_state() :: #follower_state{}).
@@ -115,12 +115,12 @@
 
 -callback init() -> State when State :: term().
 
--callback handle_command(Command, State) -> {reply, Reply, State} when
+-callback handle_command(Command, State) -> {Reply, State} when
   Command :: term(),
   State :: term(),
   Reply :: term().
 
--callback handle_query(Command, State) -> {reply, Reply} when
+-callback handle_query(Command, State) -> Reply when
   Command :: term(),
   State :: term(),
   Reply :: term().
@@ -144,21 +144,31 @@ status(ClusterMember) ->
 
 -spec join(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 join(ClusterMember, NewClusterMember) ->
-  gen_statem:call(ClusterMember, {join, NewClusterMember}, {clean_timeout, 3000}).
+  call(ClusterMember, {join, NewClusterMember}, {clean_timeout, 3000}).
 
 -spec leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 leave(ClusterMember, MemberToLeave) ->
-  gen_statem:call(ClusterMember, {leave, MemberToLeave}, {clean_timeout, 3000}).
+  call(ClusterMember, {leave, MemberToLeave}, {clean_timeout, 3000}).
 
 -spec command(pid(), term()) ->
   term().
 command(ActualClusterMember, Command) ->
-  gen_statem:call(ActualClusterMember, {command, Command}, {dirty_timeout, 10000}).
+  call(ActualClusterMember, {command, Command}, {dirty_timeout, 10000}).
 
 -spec query(pid(), term()) ->
   term().
 query(ActualClusterMember, Command) ->
-  gen_statem:call(ActualClusterMember, {query, Command}, {dirty_timeout, 10000}).
+  call(ActualClusterMember, {query, Command}, {dirty_timeout, 10000}).
+
+call(Server, Command, Timeout) ->
+  case gen_statem:call(Server, Command, Timeout) of
+    {error, {not_leader, undefined}} ->
+      {error, no_leader};
+    {error, {not_leader, Pid}} ->
+      call(Pid, Command, Timeout);
+    Else ->
+      Else
+  end.
 
 %%%===================================================================
 %%% gen_statem callbacks
@@ -328,7 +338,7 @@ handle_event(info, #append_entries_req{term = Term,
       NewState = State#state{current_term = Term,
                              voted_for = undefined,
                              log = NewLog2,
-                             %cluster = raft_cluster:leader(Cluster, Leader),
+                             cluster = raft_cluster:leader(Cluster, Leader),
                              committed_index = NewCommitIndex},
       {next_state, follower, maybe_apply_cluster_changes(Entries, maybe_apply(NewState))};
     _ when PrevLogIndex =:= 0 -> % nothing in the log yet
@@ -342,7 +352,7 @@ handle_event(info, #append_entries_req{term = Term,
       NewState = State#state{current_term = Term,
                              voted_for = undefined,
                              log = NewLog,
-                             %cluster = raft_cluster:leader(Cluster, Leader),
+                             cluster = raft_cluster:leader(Cluster, Leader),
                              committed_index = NewCommitIndex},
       {next_state, follower, maybe_apply_cluster_changes(Entries, maybe_apply(NewState))};
     _ = What->
@@ -364,7 +374,7 @@ handle_event(info, #append_entries_req{term = Term,
                                        prev_log_index = PrevLogIndex,
                                        prev_log_term = PrevLogTerm,
                                        leader_commit_index = LeaderCommitIndex}, StateName,
-  #state{current_term = Term, committed_index = CommittedIndex,
+  #state{current_term = Term, committed_index = CommittedIndex, cluster = Cluster,
          log = Log} = State) ->
   logger:debug("Got append_entries_req with ~p term, prev_log_index ~p", [Term, PrevLogIndex]),
   case raft_log:get(Log, PrevLogIndex) of
@@ -372,7 +382,8 @@ handle_event(info, #append_entries_req{term = Term,
       NextLogIndex = PrevLogIndex+1,
       NewLog = maybe_delete_log(Log, NextLogIndex, Term),
       NewLog2 = raft_log:append_commands(NewLog, Entries, NextLogIndex),
-      logger:debug("AppendEntries successfully commited", []),
+      logger:debug("AppendEntries successfully commited on index ~p",
+                   [raft_log:last_index(NewLog2)]),
       send_msg(Leader, #append_entries_resp{term = Term,
                                             server = self(),
                                             success = true,
@@ -381,7 +392,7 @@ handle_event(info, #append_entries_req{term = Term,
       NewState = State#state{current_term = Term,
                              voted_for = undefined,
                              log = NewLog2,
-                             %cluster = raft_cluster:leader(Cluster, Leader),
+                             cluster = raft_cluster:leader(Cluster, Leader),
                              committed_index = NewCommitIndex},
       NewState2 = maybe_apply_cluster_changes(Entries, maybe_apply(NewState)),
       case StateName of
@@ -402,7 +413,7 @@ handle_event(info, #append_entries_req{term = Term,
       NewState = State#state{current_term = Term,
                              voted_for = undefined,
                              log = NewLog2,
-                             %cluster = raft_cluster:leader(Cluster, Leader),
+                             cluster = raft_cluster:leader(Cluster, Leader),
                              committed_index = NewCommitIndex},
       NewState2 = maybe_apply_cluster_changes(Entries, maybe_apply(NewState)),
       case StateName of
@@ -418,7 +429,8 @@ handle_event(info, #append_entries_req{term = Term,
                                             server = self(),
                                             success = false,
                                             match_index = raft_log:last_index(Log)}),
-      {keep_state, State#state{current_term = Term, voted_for = undefined}}
+      {keep_state, State#state{current_term = Term,
+                               cluster = raft_cluster:leader(Cluster, Leader)}}
   end;
 % ************************
 % handle vote requests
@@ -491,8 +503,8 @@ handle_event(info,
       send_msg(Candidate, #vote_req_reply{term = Term, voter = self(), granted = false}),
       {keep_state, State};
     _ ->
-      logger:notice("Got vote_req for ~p with higher term ~p > ~p, accepting",
-                    [Candidate, Term, Term]),
+      logger:notice("Got vote_req for ~p, accepting",
+                    [Candidate]),
       send_msg(Candidate, #vote_req_reply{term = Term, voter = self(), granted = true}),
       {keep_state, State#state{voted_for = Candidate}, [?ELECTION_TIMEOUT]}
   end;
@@ -531,15 +543,15 @@ handle_event(state_timeout, election_timeout, leader, State) ->
   {keep_state, NewState, [?ELECTION_TIMEOUT(get_min_timeout())]};
 
 handle_event({call, From}, {command, Command}, leader, State) ->
-  StateSize = byte_size(term_to_binary(State)),
-  case StateSize > 1024*100 of
-    _ when StateSize > 1024*100 ->
-      logger:warning("State is more than 100K");
-    _ when StateSize > 1024*10 ->
-      logger:warning("State is more than 10K: ~p", [State]);
-    _ ->
-      ok
-  end,
+  %StateSize = byte_size(term_to_binary(State)),
+  %case StateSize > 1024*100 of
+  %  _ when StateSize > 1024*100 ->
+  %    logger:warning("State is more than 100K");
+  %  _ when StateSize > 1024*10 ->
+  %    logger:warning("State is more than 10K: ~p", [State]);
+  %  _ ->
+  %    ok
+  %end,
   {keep_state, handle_command(From, Command, State), [?ELECTION_TIMEOUT(get_min_timeout())]};
 handle_event({call, From}, {query, Command}, leader, #state{callback = CB, user_state = Us}) ->
   gen_statem:reply(From, apply(CB, handle_query, [Command, Us])),
@@ -584,59 +596,19 @@ handle_event(info, #append_entries_resp{} = AppendEntriesReq, leader, State) ->
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
 %% Proxy commands to leader
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
-
-handle_event({call, From}, {command, Command}, _StateName,
+handle_event({call, From}, {command, _Command}, _StateName,
              #state{cluster = Cluster}) ->
-  case raft_cluster:leader(Cluster) of
-    undefined ->
-      logger:notice("Postpone command, no leader yet", []),
-      {keep_state_and_data, [postpone]};
-    Leader ->
-      logger:debug("Proxy command to ~p", [Leader]),
-      send_msg(Leader, {proxy, {call, From}, {command, Command}}),
-      keep_state_and_data
-  end;
-handle_event({call, From}, {query, Command}, _StateName,
+    gen_statem:reply(From, {error, {not_leader, raft_cluster:leader(Cluster)}}),
+    keep_state_and_data;
+handle_event({call, From}, {query, _Command}, _StateName,
              #state{cluster = Cluster}) ->
-  case raft_cluster:leader(Cluster) of
-    undefined ->
-      logger:notice("Postpone query, no leader yet", []),
-      {keep_state_and_data, [postpone]};
-    Leader ->
-      logger:debug("Proxy query to ~p", [Leader]),
-      send_msg(Leader, {proxy, {call, From}, {query, Command}}),
-      keep_state_and_data
-  end;
+  gen_statem:reply(From, {error, {not_leader, raft_cluster:leader(Cluster)}}),
+  keep_state_and_data;
 
-handle_event({call, From}, {Type, Node}, _StateName,
+handle_event({call, From}, {Type, _Node}, _StateName,
              #state{cluster = Cluster}) when Type =:= join orelse Type =:= leave ->
-  case raft_cluster:leader(Cluster) of
-    undefined ->
-      logger:notice("Decline cluster change command, no leader", []),
-      gen_statem:reply(From, {error, no_leader}),
-      keep_state_and_data;
-    Leader ->
-      logger:debug("Proxy cluster change command to ~p", [Leader]),
-      send_msg(Leader, {proxy, {call, From}, {Type, Node}}),
-      keep_state_and_data
-  end;
-
-% handle proxy request
-handle_event(info, {proxy, Type, Context}, leader, State) ->
-  logger:debug("Got proxy request: ~p ~p", [Type, Context]),
-  handle_event(Type, Context, leader, State);
-
-
-handle_event(info, {proxy, Type, Context}, _StateName, #state{cluster = Cluster}) ->
-  case raft_cluster:leader(Cluster) of
-    undefined ->
-      % no leader, postpone request for later processing
-      {keep_state_and_data, [postpone]};
-    Leader ->
-      % now we have leader, but unfortunately we need to forward it (again)
-      send_msg(Leader, {proxy, Type, Context}),
-      keep_state_and_data
-  end;
+  gen_statem:reply(From, {error, {not_leader, raft_cluster:leader(Cluster)}}),
+  keep_state_and_data;
 
 % not leader, can be dropped?
 handle_event(info, #append_entries_resp{server = Server}, _StateName, _State) ->
@@ -675,7 +647,7 @@ handle_event(EventType, EventContent, StateName, #state{} = State) ->
 %% necessary cleaning up. When it returns, the gen_statem terminates with
 %% Reason. The return value is ignored.
 terminate(normal, _StateName, #state{log = Log} = _State) ->
-  % @TODO in case of normal stop say goodbye to other cluster member!?
+  % @TODO in case of normal stop say goodbye to other cluster members!?
   raft_log:destroy(Log),
   ok;
 terminate(_Reason, _StateName, #state{} = _State) ->
@@ -719,16 +691,16 @@ init_user_state(#state{callback = CallbackModule} = State) ->
   State#state{user_state = apply(CallbackModule, init, [])}.
 
 execute({?CLUSTER_CHANGE, _NewCluster}, State) ->
-  {reply, ok, State};
+  {ok, State};
 execute({?JOINT_CLUSTER_CHANGE, {_JointCluster, _FinalCluster}}, State) ->
-  {reply, ok, State};
+  {ok, State};
 execute(Command, #state{callback = CallbackModule, user_state = UserState} = State) ->
   logger:debug("Execute log command ~p", [Command]),
   % @TODO: while apply command gen server should be able to respond (execute command might take a
   % wile, in worst case more than heartbeat timeout)
   case apply(CallbackModule, handle_command, [Command, UserState]) of
-    {reply, Reply, NewUserState} ->
-      {reply, Reply, State#state{user_state = NewUserState}}
+    {Reply, NewUserState} ->
+      {Reply, State#state{user_state = NewUserState}}
   end.
 
 apply_cluster_change(NewCluster, State) ->
@@ -787,7 +759,7 @@ maybe_apply(#state{last_applied = LastApplied, committed_index = CommittedIndex,
     {ok, {_Term, {?JOINT_CLUSTER_CHANGE, {JointCluster, _FinalCluster}}}} ->
       maybe_apply(State#state{last_applied = CurrentIndex, cluster = JointCluster});
     {ok, {_Term, Command}} ->
-      {reply, _, NewState} = execute(Command, State),
+      {_, NewState} = execute(Command, State),
       maybe_apply(NewState#state{last_applied = CurrentIndex})
   end;
 maybe_apply(State) ->
@@ -800,7 +772,7 @@ handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
                       inner_state = #leader_state{active_requests = CurrentRequests,
                                                   peers = Peers} = LeaderState
                } = State) ->
-  logger:debug("Handling cluster change: ~p", [Command]),
+  logger:debug("Handling cluster change (joint step): ~p", [Command]),
   JointCluster = raft_cluster:joint_cluster(CurrentCluster, NewCluster),
   JointConsensusClusterChangeCommand = {?JOINT_CLUSTER_CHANGE, {JointCluster, NewCluster}},
   NewLog = raft_log:append(Log, JointConsensusClusterChangeCommand, Term),
@@ -826,7 +798,7 @@ handle_command(From, {?CLUSTER_CHANGE, NewCluster} = Command,
                       inner_state = #leader_state{active_requests = CurrentRequests,
                                                   peers = Peers} = LeaderState
                } = State) ->
-  logger:debug("Handling cluster change: ~p", [Command]),
+  logger:debug("Handling final cluster change: ~p", [Command]),
   NewLog = raft_log:append(Log, {?CLUSTER_CHANGE, NewCluster}, Term),
   NewLeaderState = LeaderState#leader_state{peers = update_peers(Peers, NewCluster, NewLog)},
   NewState = State#state{log = NewLog, inner_state = NewLeaderState, cluster = NewCluster},
@@ -835,7 +807,7 @@ handle_command(From, {?CLUSTER_CHANGE, NewCluster} = Command,
   LogIndex = raft_log:last_index(NewLog),
   ActiveRequest = #request{log_index = LogIndex,
                            from = From,
-                           majority = raft_cluster:member_count(NewCluster)},
+                           majority = raft_cluster:majority_count(NewCluster)},
   NewCurrentActiveRequests = CurrentRequests#{LogIndex => ActiveRequest},
   NewLeaderState2 = NewLeaderState#leader_state{active_requests = NewCurrentActiveRequests},
 
@@ -904,11 +876,12 @@ handle_append_entries_resp(#append_entries_resp{success = false,
                                   current_term = Term,
                                   committed_index = CommittedIndex
                           } = State) ->
-  logger:warning("Got negative appen_entries_resp from ~p with ~p match_index", [Server, MatchIndex]),
+  logger:notice("Got negative appen_entries_resp from ~p with ~p match_index",
+                [Server, MatchIndex]),
   case maps:get(Server, Peers, not_found) of
     not_found ->
-      logger:notice("Got negative appen_entries_resp from unkown server ~p -> ~p", [Server,
-                                                                                     Peers]),
+      logger:notice("Got negative appen_entries_resp from unkown server ~p -> ~p",
+                    [Server, Peers]),
       State;
     Peer ->
       %@TODO match index based, next index it could speed up catching up
@@ -1012,14 +985,14 @@ handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) ->
       logger:debug("No active request found for index ~p",  [MatchIndex]),
       ActiveRequests;
     #request{replicated = Replicated} = ActiveRequest ->
-      logger:debug("Active request found for index ~p", [MatchIndex]),
+      logger:debug("Active request found for index ~p -> ~p", [MatchIndex, ActiveRequest]),
       NewReplicated = case lists:member(Server, Replicated) of
                         true -> Replicated;
                         _ -> [Server | Replicated]
                       end,
       NewActiveRequest = ActiveRequest#request{replicated = NewReplicated},
       NewActiveRequests = ActiveRequests#{MatchIndex => NewActiveRequest},
-      case replicated_indexes(NewActiveRequests, CommittedIndex, []) of
+      case replicated_indexes(NewActiveRequests, CommittedIndex+1, []) of
         {UpdatedNewActiveRequest, []} ->
           UpdatedNewActiveRequest;
         {UpdatedNewActiveRequest, IndexesToCommit} ->
@@ -1028,21 +1001,24 @@ handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) ->
   end.
 
 replicated_indexes(Requests, Index, Acc) ->
-  NextIndex = Index + 1,
-  case maps:get(NextIndex, Requests, not_found) of
+  logger:debug("rep i: i:~p => ~p", [Index, Requests]),
+  case maps:get(Index, Requests, not_found) of
     #request{replicated = Replicated, majority = Majority, from = From}
       when length(Replicated) >= Majority ->
-      logger:debug("Majority of the logs are successfully replicated for index ~p", [NextIndex]),
-      NewRequests = maps:remove(NextIndex, Requests),
-      replicated_indexes(NewRequests, NextIndex, [{NextIndex, From} | Acc]);
-    _ ->
+      logger:debug("Majority of the logs are successfully replicated for index ~p", [Index]),
+      NewRequests = maps:remove(Index, Requests),
+      replicated_indexes(NewRequests, Index+1, [{Index, From} | Acc]);
+    not_found when map_size(Requests) > 0 ->
+      NextActiveRequestIndex = lists:min(maps:keys(Requests)),
+      replicated_indexes(Requests, NextActiveRequestIndex, Acc);
+    _  ->
       {Requests, lists:reverse(Acc)}
   end.
 
 commit_index(Server, State, Index, From) ->
   NewState2 = State#state{committed_index = Index},
   {ok, {_Term, Command}} = raft_log:get(State#state.log, Index),
-  {reply, Reply, NewState3} = execute(Command, NewState2),
+  {Reply, NewState3} = execute(Command, NewState2),
   NewState4 = NewState3#state{last_applied = Index},
   case Command of
     {?JOINT_CLUSTER_CHANGE, {_JointCluster, FinalCluster}} ->
