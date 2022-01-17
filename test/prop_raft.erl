@@ -4,21 +4,12 @@
 %% Model Callbacks
 -export([command/1, initial_state/0, next_state/3,
          precondition/2, postcondition/3,
-         stop_collaborator/1, add_collaborator/1, kill_collaborator/1]).
+         stop_collaborator/1, kill_collaborator/1]).
 
--record(state, {
+-record(test_state, {
   collaborators = [] :: [pid()],
   storage = #{}
 }).
-
-add_collaborator(ClusterMember) ->
-  {ok, Pid} = raft:start(raft_test_cb),
-  case catch raft:join(ClusterMember, Pid) of
-    ok ->
-      {ok, Pid};
-    Else ->
-      Else
-  end.
 
 stop_collaborator(Pid) ->
   raft:stop(Pid).
@@ -27,27 +18,22 @@ kill_collaborator(Pid) ->
   exit(Pid, kill),
   ok.
 
-
 %%%%%%%%%%%%%%%%%%
 %%% PROPERTIES %%%
 %%%%%%%%%%%%%%%%%%
 prop_test() ->
   application:ensure_all_started(raft),
   setup_config(),
-  ?FORALL(Cmds, commands(?MODULE, initial_state()),
-          begin
-              {History, State, Result} = run_commands(?MODULE, Cmds),
-              %CompareStates = compare_states(State#state.collaborators),
-              %[raft:stop(Pid) || Pid <- State#state.collaborators],
-              ?WHENFAIL(
-                begin
-                  io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
-                end,
-                aggregate(command_names(Cmds),
-                          Result =:= ok
-                          %andalso CompareStates =:= ok
-                ))
-          end).
+  ?FORALL(Cmds, commands(?MODULE),
+          ?TRAPEXIT(begin
+                      {History, State, Result} = run_commands(?MODULE, Cmds),
+                      %[raft:stop(Pid) || Pid <- State#test_state.collaborators],
+                      ?WHENFAIL(
+                        begin
+                          io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
+                        end,
+                        aggregate(command_names(Cmds), Result =:= ok))
+                  end)).
 
 %%%%%%%%%%%%%
 %%% MODEL %%%
@@ -55,49 +41,48 @@ prop_test() ->
 %% @doc Initial model value at system start. Should be deterministic.
 initial_state() ->
   {ok, Pid} = raft:start(raft_test_cb),
-  setup_config(),
-  Collaborators = [Pid],
-  #state{collaborators = Collaborators}.
+  #test_state{collaborators = [Pid]}.
 
 %% @doc List of possible commands to run against the system
-command(#state{collaborators = Collaborators} = _State) ->
+command(State) ->
   frequency([
-    {50, {call, raft, command, [oneof(Collaborators), {store, store_key(), pos_integer()}]}},
-    {4, {call, ?MODULE, add_collaborator, [oneof(Collaborators)]}},
-    {3, {call, raft, leave, [oneof(Collaborators), oneof(Collaborators)]}},
-    {1, {call, ?MODULE, kill_collaborator, [oneof(Collaborators)]}},
-    {1, {call, ?MODULE, stop_collaborator, [oneof(Collaborators)]}}
-  ]).
+    {20, {call, raft, command, [oneof(State#test_state.collaborators), {store, store_key(), pos_integer()}]}},
+    {4, {call, raft, join, [oneof(State#test_state.collaborators), frequency([{10, new_member()},
+                                                                              {1, oneof(State#test_state.collaborators)}])]}},
+    {3, {call, raft, leave, [oneof(State#test_state.collaborators), oneof(State#test_state.collaborators)]}},
+    {1, {call, ?MODULE, kill_collaborator, [oneof(State#test_state.collaborators)]}},
+    {1, {call, ?MODULE, stop_collaborator, [oneof(State#test_state.collaborators)]}}
+ ]).
 
 %% @doc Determines whether a command should be valid under the
 %% current state.
-precondition(#state{collaborators = [_Item]}, {call, raft, leave, [_]}) ->
+precondition(#test_state{collaborators = [_Item]}, {call, raft, leave, [_]}) ->
   false;
-precondition(#state{collaborators = [_Item]}, {call, ?MODULE, kill_collaborator, [_]}) ->
+precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, kill_collaborator, [_]}) ->
   false;
-precondition(#state{collaborators = [_Item]}, {call, ?MODULE, stop_collaborator, [_]}) ->
+precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, stop_collaborator, [_]}) ->
   false;
-precondition(#state{}, {call, raft, command, _}) ->
+precondition(#test_state{}, {call, raft, command, _}) ->
   true;
-precondition(#state{}, {call, ?MODULE, add_collaborator, _}) ->
+precondition(#test_state{}, {call, raft, join, _}) ->
   true;
-precondition(#state{collaborators = Collaborators},
-             {call, _Module, _Function, [On | _]} = C) ->
-  case lists:member(On, Collaborators) of
-    false ->
-      io:format(user, "call on ~p -> ~p : ~p~n", [C, Collaborators, false]);
-    _ ->
-      ok
-  end,
-  lists:member(On, Collaborators);
-precondition(#state{}, {call, _Mod, _Fun, _Args}) ->
+%precondition(#test_state{collaborators = Collaborators},
+%             {call, _Module, _Function, [On | _]} = C) ->
+%  case lists:member(On, Collaborators) of
+%    false ->
+%      io:format(user, "call on ~p -> ~p : ~p~n", [C, Collaborators, false]);
+%    _ ->
+%      ok
+%  end,
+%  lists:member(On, Collaborators);
+precondition(#test_state{}, {call, _Mod, _Fun, _Args}) ->
   true.
 
 %% @doc Given the state `State' *prior* to the call
 %% `{call, Mod, Fun, Args}', determine whether the result
 %% `Res' (coming from the actual system) makes sense.
-postcondition(#state{storage = Storage, collaborators = Cluster} = _State,
-              {call, raft, command, [On, {store, Key, Value}]}, {ok, StoredValue}) ->
+postcondition(#test_state{storage = Storage, collaborators = Cluster} = _State,
+              {call, raft, command, [On, {store, Key, Value}]}, {ok, _StoredValue}) ->
   StorageGet = maps:get(Key, Storage, 0),
   case lists:member(On, Cluster) of
     true ->
@@ -112,15 +97,17 @@ postcondition(#state{storage = Storage, collaborators = Cluster} = _State,
     _ ->
       true
   end;
-postcondition(#state{} = _State, {call, raft, command, [_On, _]}, {error, no_leader}) ->
+postcondition(#test_state{} = _State, {call, raft, command, [_On, _]}, {error, no_leader}) ->
   true;
-postcondition(#state{} = _State, {call, raft, command, [_On, _]}, {error, leader_changed}) ->
+postcondition(#test_state{} = _State, {call, raft, command, [_On, _]}, {error, leader_changed}) ->
   true;
-postcondition(_State, {call, ?MODULE, add_collaborator, [_On]}, {ok, _NewMember}) ->
+postcondition(_State, {call, raft, join, [_On, _]}, ok) ->
   true;
-postcondition(_State, {call, ?MODULE, add_collaborator, [_On]}, {error, no_leader}) ->
+postcondition(_State, {call, raft, join, [_On, _]}, {error, no_leader}) ->
   true;
-postcondition(_State, {call, ?MODULE, add_collaborator, [_On]}, {error, leader_changed}) ->
+postcondition(_State, {call, raft, join, [_On, _]}, {error, leader_changed}) ->
+  true;
+postcondition(_State, {call, raft, join, [_On, _]}, {error, already_member}) ->
   true;
 postcondition(_State, {call, raft, leave, [_On, _Target]}, ok) ->
   true;
@@ -140,33 +127,32 @@ postcondition(_State, {call, _Mod, _Fun, _Args} = A, _Res) ->
 
 %% @doc Assuming the postcondition for a call was true, update the model
 %% accordingly for the test to proceed.
-next_state(#state{storage = Storage, collaborators = InCluster} = State, {ok, Value},
+next_state(#test_state{storage = Storage, collaborators = InCluster} = State, {ok, Value},
            {call, raft, command, [On, {store, Key, _Value}]}) ->
   case lists:member(On, InCluster) of
     true ->
-      State#state{storage = Storage#{Key => Value}};
+      State#test_state{storage = Storage#{Key => Value}};
     _ ->
       State
   end;
 
-next_state(#state{collaborators = InCluster} = State, {ok, NewMember},
-           {call, ?MODULE, add_collaborator, [_On]}) ->
-  State#state{collaborators = [NewMember | InCluster]};
+next_state(#test_state{collaborators = InCluster} = State, _Result,
+           {call, raft, join, [_On, Target]}) ->
+  State#test_state{collaborators = [Target | InCluster]};
 
-next_state(#state{collaborators = InCluster} = State, ok,
+next_state(#test_state{collaborators = InCluster} = State, ok,
            {call, raft, leave, [_On, Target]}) ->
-  State#state{collaborators = lists:delete(Target, InCluster)};
+  State#test_state{collaborators = lists:delete(Target, InCluster)};
 
-next_state(#state{collaborators = InCluster} = State, ok,
+next_state(#test_state{collaborators = InCluster} = State, ok,
            {call, ?MODULE, kill_collaborator, [Target]}) ->
-  State#state{collaborators = lists:delete(Target, InCluster)};
+  State#test_state{collaborators = lists:delete(Target, InCluster)};
 
-next_state(#state{collaborators = InCluster} = State, ok,
+next_state(#test_state{collaborators = InCluster} = State, ok,
            {call, ?MODULE, stop_collaborator, [Target]}) ->
-  State#state{collaborators = lists:delete(Target, InCluster)};
-
+  State#test_state{collaborators = lists:delete(Target, InCluster)};
 next_state(State, _Res, {call, _Mod, _Fun, _Args}) ->
-    State.
+  State.
 
 store_key() ->
   integer(1, 100).
@@ -199,45 +185,9 @@ setup_config() ->
   logger:set_process_metadata(NewMeta).
 
 
-compare_states([]) ->
-  ok;
-compare_states(Servers) ->
-  raft:command(hd(Servers), noop), % to execute last state chaining command on followers
-  compare_states(Servers, 3).
-
-compare_states(Servers, MaxWaits) ->
-  %io:format(user, "Comparing user states ~n", []),
-  UserStates = get_user_states(Servers),
-  case do_compare_term([UserState || {_, UserState} <- UserStates]) of
-    ok ->
-      ok;
-    diff when MaxWaits > 0 ->
-      %io:format(user, "Found diff but may not catch up the follower, waiting ~n", []),
-      timer:sleep(100),
-      compare_states(Servers, MaxWaits-1);
-    diff ->
-      DiffPr = [{Server, last_log_index(Server), UserState, raft:status(Server)} ||
-                 {Server, UserState} <- UserStates],
-      io:format(user, "Diff: ~p ~n", [DiffPr]),
-      {diff, DiffPr}
-  end.
-
-do_compare_term([Base | Rest]) ->
-  compare_term(Rest, Base).
-
-compare_term([], _Base) ->
-  ok;
-compare_term([Base | Rest], Base) ->
-  compare_term(Rest, Base);
-compare_term([Diff | _Rest], Base) when Diff =/= Base ->
-  diff.
-
-get_user_states(Servers) ->
-  [begin
-     {_, State} = sys:get_state(Server),
-     {Server, erlang:element(3, State)}
-   end || Server <- Servers].
-
-last_log_index(Server) ->
-  #{log_last_index := La} = raft:status(Server),
-  La.
+new_member() ->
+  ?LET(Wait, integer(0, 300), begin
+                                {ok, Pid} = raft:start(raft_test_cb),
+                                timer:sleep(Wait),
+                                Pid
+                              end).

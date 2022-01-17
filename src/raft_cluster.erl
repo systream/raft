@@ -13,8 +13,9 @@
 -record(raft_cluster, {
     members = [] :: [pid()],
     leader = undefined :: pid() | undefined,
-    majority = 0 :: pos_integer()
-    }).
+    majority = 0 :: pos_integer(),
+    term = 1 :: pos_integer()
+  }).
 
 -type(cluster() :: #raft_cluster{}).
 
@@ -26,7 +27,7 @@
          members/1, is_member/2,
          majority_count/1, member_count/1,
          leader/2, leader/1,
-         joint_cluster/2]).
+         joint_cluster/2, term/1, increase_term/1]).
 
 -spec new() -> cluster().
 new() ->
@@ -42,7 +43,7 @@ leader(#raft_cluster{leader = Leader}) ->
 
 -spec leader(cluster(), pid() | undefined) -> cluster().
 leader(Cluster, undefined) ->
-  Cluster#raft_cluster{leader = undefined};
+  increase_term(Cluster#raft_cluster{leader = undefined});
 leader(Cluster, Leader) ->
   case is_member(Leader, Cluster) of
     true ->
@@ -55,11 +56,15 @@ leader(Cluster, Leader) ->
 joint_cluster(#raft_cluster{members = CurrentClusterMembers} = Cluster,
               #raft_cluster{members = NewClusterMembers}) ->
   JointClusterMembers = lists:usort(CurrentClusterMembers ++ NewClusterMembers),
-  update_majority(Cluster#raft_cluster{members = JointClusterMembers}).
+  increase_term(update_majority(Cluster#raft_cluster{members = JointClusterMembers})).
 
 -spec members(cluster()) -> [pid()].
 members(#raft_cluster{members = Members}) ->
     Members.
+
+-spec term(cluster()) -> pos_integer().
+term(#raft_cluster{term = Term}) ->
+  Term.
 
 -spec majority_count(cluster()) -> pos_integer().
 majority_count(#raft_cluster{majority = Majority}) ->
@@ -75,7 +80,7 @@ join(Member, #raft_cluster{members = Members} = State) ->
     true ->
       {error, already_member};
     _ ->
-      {ok, update_majority(State#raft_cluster{members = [Member | Members]})}
+      {ok, increase_term(update_majority(State#raft_cluster{members = [Member | Members]}))}
   end.
 
 -spec leave(pid(), cluster()) ->
@@ -94,9 +99,13 @@ leave(Member, #raft_cluster{members = Members} = State) ->
                       _ ->
                         NewCluster
                     end,
-      {ok, NewCluster2}
+      {ok, increase_term(NewCluster2)}
   end.
 
 -spec member_count(cluster()) -> pos_integer().
 member_count(#raft_cluster{members = Members}) ->
     length(Members).
+
+-spec increase_term(cluster()) -> cluster().
+increase_term(#raft_cluster{term = Term} = Cluster) ->
+  Cluster#raft_cluster{term = Term+1}.

@@ -16,7 +16,7 @@
          destroy/1,
          last_index/1, last_term/1,
          get/2, delete/2, get_term/3, list/3,
-         next_index/1]).
+         next_index/1, get_term/2]).
 
 -record(log_ref, {data_ref :: term(),
                   callback :: module(),
@@ -63,7 +63,10 @@ append(#log_ref{data_ref = Ref, last_term = LastTerm, callback = Cb} = LogRef, C
   NewPos = next_index(LogRef),
   logger:debug("Storing log entry on index ~p with term ~p command ~p", [NewPos, Term, Command]),
   NewRef = apply(Cb, append, [Ref, #log_entry{log_index = NewPos, term = Term, command = Command}]),
-  LogRef#log_ref{last_index = NewPos, last_term = Term, penultimate_term = LastTerm, data_ref = NewRef}.
+  LogRef#log_ref{last_index = NewPos,
+                 last_term = Term,
+                 penultimate_term = LastTerm,
+                 data_ref = NewRef}.
 
 -spec append_commands(log_ref(), [{raft_term(), command()}], log_index()) -> log_ref().
 append_commands(LogRef, [], _NextIndex) ->
@@ -77,19 +80,28 @@ append_commands(#log_ref{last_index = LastIndex} = Log, [{Term, Command} | RestC
   end.
 
 -spec get_term(log_ref(), log_index() | 0, term()) -> raft_term().
-get_term(#log_ref{last_index = LastIndex, penultimate_term = Term}, Index, _DefaultTerm) when
+get_term(LogRef, Index, DefaultTerm) ->
+  case get_term(LogRef, Index) of
+    {ok, Term} ->
+      Term;
+    no_term ->
+      DefaultTerm
+  end.
+
+-spec get_term(log_ref(), log_index() | 0) -> {ok, raft_term()} | no_term.
+get_term(#log_ref{last_index = LastIndex, penultimate_term = Term}, Index) when
   Term =/= undefined andalso LastIndex-1 =:= Index  ->
-  Term;
-get_term(#log_ref{}, 0, DefaultTerm) ->
-  DefaultTerm;
-get_term(#log_ref{last_index = Index, last_term = Term}, Index, _DefaultTerm) ->
-  Term;
-get_term(Log, Index, DefaultTerm) ->
+  {ok, Term};
+get_term(#log_ref{}, 0) ->
+  no_term;
+get_term(#log_ref{last_index = Index, last_term = Term}, Index) ->
+  {ok, Term};
+get_term(Log, Index) ->
   case raft_log:get(Log, Index) of
     {ok, {LTerm, _Command}} ->
-      LTerm;
+      {ok, LTerm};
     not_found ->
-      DefaultTerm
+      no_term
   end.
 
 -spec get(log_ref(), log_index()) -> {ok, {raft_term(), command()}} | not_found.
@@ -119,9 +131,9 @@ get_list(_Log, _CurrentIndex, _FromIndex, Acc) ->
 
 -spec next_index(log_ref()) -> log_index().
 next_index(#log_ref{last_index = LastIndex}) ->
-    LastIndex+1.
+LastIndex+1.
 
--spec delete(log_ref(), log_index()) -> log_ref().
+-spec delete(log_ref(), log_index() | 0) -> log_ref().
 delete(#log_ref{data_ref = Ref, last_index = LastIndex, callback = Callback} = LogRef, Index)
   when LastIndex >= Index ->
     NewRef = apply(Callback, delete, [Ref, LastIndex]),

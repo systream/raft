@@ -33,7 +33,15 @@ handle_command(noop, State) ->
   {ok, State};
 handle_command({sleep, Time}, State) ->
   timer:sleep(Time),
-  {ok, State}.
+  {ok, State};
+
+handle_command({register, Key, Pid}, State) ->
+  case maps:get(Key, State, not_registered) of
+    not_registered ->
+      {ok, State#{Key => Pid}};
+    RegPid ->
+      {{error, {already_registered, RegPid}}, State}
+  end.
 
 -spec handle_query(Command, State) -> Reply when
   Command :: term(),

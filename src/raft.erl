@@ -26,7 +26,6 @@ stop(Server) ->
 command(ClusterMember, Command) ->
   raft_server:command(ClusterMember, Command).
 
-
 -spec query(pid(), term()) ->
   term().
 query(ClusterMember, Command) ->
