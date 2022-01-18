@@ -101,6 +101,7 @@ groups() ->
       , command_alone
       , command_cluster
       , join_cluster
+      , join_cluster_cross
       , new_leader
       , catch_up
       , cluster_leave
@@ -190,6 +191,24 @@ join_cluster(_Config) ->
   assert_status(Leader, leader, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave1, follower, Leader, [Slave1, Slave2, Leader]),
   assert_status(Slave2, follower, Leader, [Slave1, Slave2, Leader]),
+
+  stop([Leader, Slave1, Slave2]).
+
+join_cluster_cross(_Config) ->
+  {ok, Leader} = raft:start(raft_test_cb),
+  {ok, Slave1} = raft:start(raft_test_cb),
+  {ok, Slave2} = raft:start(raft_test_cb),
+
+  logger:set_primary_config(level, debug),
+  retry_until({raft, join, [Slave1, Leader]}),
+  retry_until({raft, join, [Slave2, Leader]}),
+
+  #{cluster_members := MembersL} = raft:status(Leader),
+  #{cluster_members := MembersS1} = raft:status(Slave1),
+  #{cluster_members := MembersS2} = raft:status(Slave2),
+
+  ?assertEqual(MembersL, MembersS1),
+  ?assertEqual(MembersL, MembersS2),
 
   stop([Leader, Slave1, Slave2]).
 

@@ -25,15 +25,16 @@ prop_test() ->
   application:ensure_all_started(raft),
   setup_config(),
   ?FORALL(Cmds, commands(?MODULE),
-          ?TRAPEXIT(begin
-                      {History, State, Result} = run_commands(?MODULE, Cmds),
-                      %[raft:stop(Pid) || Pid <- State#test_state.collaborators],
-                      ?WHENFAIL(
-                        begin
-                          io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
-                        end,
-                        aggregate(command_names(Cmds), Result =:= ok))
-                  end)).
+          begin
+            {History, State, Result} = run_commands(?MODULE, Cmds),
+            %[raft:stop(Pid) || Pid <- State#test_state.collaborators],
+            ?WHENFAIL(
+              begin
+                io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
+              end,
+              aggregate(command_names(Cmds), Result =:= ok)
+            )
+          end).
 
 %%%%%%%%%%%%%
 %%% MODEL %%%
@@ -46,7 +47,7 @@ initial_state() ->
 %% @doc List of possible commands to run against the system
 command(State) ->
   frequency([
-    {20, {call, raft, command, [oneof(State#test_state.collaborators), {store, store_key(), pos_integer()}]}},
+    {10, {call, raft, command, [oneof(State#test_state.collaborators), {store, store_key(), pos_integer()}]}},
     {4, {call, raft, join, [oneof(State#test_state.collaborators), frequency([{10, new_member()},
                                                                               {1, oneof(State#test_state.collaborators)}])]}},
     {3, {call, raft, leave, [oneof(State#test_state.collaborators), oneof(State#test_state.collaborators)]}},
@@ -56,25 +57,16 @@ command(State) ->
 
 %% @doc Determines whether a command should be valid under the
 %% current state.
-precondition(#test_state{collaborators = [_Item]}, {call, raft, leave, [_]}) ->
-  false;
-precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, kill_collaborator, [_]}) ->
-  false;
-precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, stop_collaborator, [_]}) ->
-  false;
-precondition(#test_state{}, {call, raft, command, _}) ->
-  true;
-precondition(#test_state{}, {call, raft, join, _}) ->
-  true;
-%precondition(#test_state{collaborators = Collaborators},
-%             {call, _Module, _Function, [On | _]} = C) ->
-%  case lists:member(On, Collaborators) of
-%    false ->
-%      io:format(user, "call on ~p -> ~p : ~p~n", [C, Collaborators, false]);
-%    _ ->
-%      ok
-%  end,
-%  lists:member(On, Collaborators);
+%precondition(#test_state{collaborators = [_Item]}, {call, raft, leave, [_]}) ->
+%  false;
+%precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, kill_collaborator, [_]}) ->
+%  false;
+%precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, stop_collaborator, [_]}) ->
+%  false;
+%precondition(#test_state{}, {call, raft, command, _}) ->
+%  true;
+%precondition(#test_state{}, {call, raft, join, _}) ->
+%  true;
 precondition(#test_state{}, {call, _Mod, _Fun, _Args}) ->
   true.
 
@@ -120,6 +112,10 @@ postcondition(_State, {call, raft, leave, [_On, _Target]}, {error, last_member_i
 postcondition(_State, {call, ?MODULE, kill_collaborator, [_Pid]}, ok) ->
   true;
 postcondition(_State, {call, ?MODULE, stop_collaborator, [_Pid]}, ok) ->
+  true;
+postcondition(_State, {call, _Mod, _Fun, _Args}, {'EXIT', {noproc, _}}) ->
+  true;
+postcondition(_State, {call, _Mod, _Fun, _Args}, {'EXIT', noproc}) ->
   true;
 postcondition(_State, {call, _Mod, _Fun, _Args} = A, _Res) ->
   io:format("unhandled post condition: ~p~n~p~n", [A, _Res]),

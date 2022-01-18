@@ -13,23 +13,23 @@
 -behavior(raft_log).
 
 %% API
--export([new/0, append/2, lookup/2, delete/2, destroy/1]).
+-export([new/0, store/3, lookup/2, delete/2, destroy/1]).
 
 -spec new() -> State when State :: term().
 new() ->
-  ets:new(raft_log, [public, ordered_set, {keypos, 2}]).
+  ets:new(raft_log, [public, ordered_set, {keypos, 1}]).
 
--spec append(State, raft_log:log_entry()) -> State when State :: term().
-append(Ref, Data) ->
-  ets:insert(Ref, Data),
+-spec store(State, log_index(), raft_log:log_entry()) -> State when State :: term().
+store(Ref, Index, Data) ->
+  ets:insert(Ref, {Index, Data}),
   Ref.
 
--spec lookup(State, log_index()) -> State when State :: term().
+-spec lookup(term(), log_index()) -> {ok, raft_log:log_entry()} | not_found.
 lookup(Ref, Index) ->
   case ets:lookup(Ref, Index) of
     [] ->
       not_found;
-    [Data] ->
+    [{_, Data}] ->
       {ok, Data}
   end.
 

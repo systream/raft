@@ -94,10 +94,8 @@ leave(Member, #raft_cluster{members = Members} = State) ->
     _ ->
       NewCluster = update_majority(State#raft_cluster{members = lists:delete(Member, Members)}),
       NewCluster2 = case Member =:= leader(NewCluster) of
-                      true ->
-                        leader(NewCluster, undefined);
-                      _ ->
-                        NewCluster
+                      true -> leader(NewCluster, undefined);
+                      _ -> NewCluster
                     end,
       {ok, increase_term(NewCluster2)}
   end.

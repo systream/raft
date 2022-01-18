@@ -219,8 +219,8 @@ format_status(_Opt, [_PDict, StateName, #state{current_term = CurrentTerm, clust
 %% Follower
 %% %%%%%%%%%%%%%%%
 handle_event(enter, PrevStateName, follower, #state{cluster = Cluster} = State) ->
-  logger:info("Became a follower", []),
   set_logger_meta(#{raft_role => follower}),
+  logger:info("Became a follower", []),
   case PrevStateName of
     leader -> cancel_all_pending_requests(State#state.inner_state);
     _ -> ok
@@ -328,119 +328,59 @@ handle_event(info, #append_entries_req{term = Term,
                                        leader = Leader,
                                        entries = Entries,
                                        prev_log_index = PrevLogIndex,
-                                       prev_log_term = PrevLogTerm,
-                                       leader_commit_index = LeaderCommitIndex}, _StateName,
-             #state{current_term = CurrentTerm, committed_index = CommittedIndex,
-                    log = Log, cluster = Cluster} = State)
+                                       prev_log_term = PrevLogTerm} = AppendEntriesReq, _StateName,
+             #state{current_term = CurrentTerm, log = Log, cluster = Cluster} = State)
   when Term > CurrentTerm ->
   logger:debug("Got append_entries_req with higher Term ~p > ~p", [Term, CurrentTerm]),
-  case raft_log:get_term(Log, PrevLogIndex) of
-    {ok, PrevLogTerm} -> % log exists and the term matched
-      NextLogIndex = PrevLogIndex+1,
-      NewLog = maybe_delete_log(Log, NextLogIndex, Term),
-      NewLog2 = raft_log:append_commands(NewLog, Entries, NextLogIndex),
-      logger:debug("AppendEntries successfully commited", []),
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = true,
-                                            match_index = raft_log:last_index(NewLog2)}),
-      NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CommittedIndex, NewLog2),
-      NewState = State#state{current_term = Term,
-                             voted_for = undefined,
-                             log = NewLog2,
-                             cluster = raft_cluster:leader(Cluster, Leader),
-                             committed_index = NewCommitIndex},
-      {next_state, follower, maybe_apply_cluster_changes(Entries, maybe_apply(NewState)), [?ELECTION_TIMEOUT]};
-    _ when PrevLogIndex =:= 0 -> % nothing in the log yet
-      NewLog = raft_log:append_commands(maybe_delete_log(Log, PrevLogIndex+1, Term), Entries, PrevLogIndex+1),
-      logger:debug("AppendEntries successfully commited", []),
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = true,
-                                            match_index = raft_log:last_index(NewLog)}),
-      NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CommittedIndex, NewLog),
-      NewState = State#state{current_term = Term,
-                             voted_for = undefined,
-                             log = NewLog,
-                             cluster = raft_cluster:leader(Cluster, Leader),
-                             committed_index = NewCommitIndex},
-      {next_state, follower, maybe_apply_cluster_changes(Entries, maybe_apply(NewState)), [?ELECTION_TIMEOUT]};
-    _ = What->
-      logger:notice("Previous log entry ~p not matched reply false -> ~p", [PrevLogIndex, What]),
-      % reply false, and step down
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = false,
-                                            match_index = raft_log:last_index(Log)}),
-      NewState = State#state{current_term = Term,
-                             voted_for = undefined,
-                             cluster = raft_cluster:leader(Cluster, Leader)},
-      {next_state, follower, maybe_apply_cluster_changes(Entries, NewState), [?ELECTION_TIMEOUT]}
-  end;
+  NewState2 =
+    case raft_log:get_term(Log, PrevLogIndex) of
+      {ok, PrevLogTerm} -> % log exists and the term matched
+        NewState = store_entries(AppendEntriesReq, State),
+        NewState#state{voted_for = undefined};
+      _ when PrevLogIndex =:= 0 -> % nothing in the log yet
+        NewState = store_entries(AppendEntriesReq, State),
+        NewState#state{voted_for = undefined};
+      _ = What->
+        logger:notice("Previous log entry ~p not matched reply false -> ~p", [PrevLogIndex, What]),
+        % reply false, and step down
+        send_msg(Leader, #append_entries_resp{term = Term,
+                                              server = self(),
+                                              success = false,
+                                              match_index = raft_log:last_index(Log)}),
+        maybe_apply_cluster_changes(Entries,
+                                    State#state{current_term = Term,
+                                                cluster = raft_cluster:leader(Cluster, Leader)})
+    end,
+  {next_state, follower, NewState2#state{voted_for = undefined}, [?ELECTION_TIMEOUT]};
 
 % append entries with same term
 handle_event(info, #append_entries_req{term = Term,
                                        leader = Leader,
                                        entries = Entries,
                                        prev_log_index = PrevLogIndex,
-                                       prev_log_term = PrevLogTerm,
-                                       leader_commit_index = LeaderCommitIndex}, StateName,
-  #state{current_term = Term, committed_index = CommittedIndex, cluster = Cluster,
-         log = Log} = State) ->
+                                       prev_log_term = PrevLogTerm} = AppendEntriesReq, StateName,
+                    #state{current_term = Term, cluster = Cluster, log = Log} = State) ->
   logger:debug("Got append_entries_req with ~p term, prev_log_index ~p", [Term, PrevLogIndex]),
-  case raft_log:get_term(Log, PrevLogIndex) of
-    {ok, PrevLogTerm} -> % log exists and the term matched
-      NextLogIndex = PrevLogIndex+1,
-      NewLog = maybe_delete_log(Log, NextLogIndex, Term),
-      NewLog2 = raft_log:append_commands(NewLog, Entries, NextLogIndex),
-      logger:debug("AppendEntries successfully commited on index ~p",
-                   [raft_log:last_index(NewLog2)]),
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = true,
-                                            match_index = raft_log:last_index(NewLog2)}),
-      NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CommittedIndex, NewLog2),
-      NewState = State#state{current_term = Term,
-                             voted_for = undefined,
-                             log = NewLog2,
-                             cluster = raft_cluster:leader(Cluster, Leader),
-                             committed_index = NewCommitIndex},
-      NewState2 = maybe_apply_cluster_changes(Entries, maybe_apply(NewState)),
-      case StateName of
-        leader ->
-          {next_state, follower, NewState2, [?ELECTION_TIMEOUT]};
-        _ ->
-          {keep_state, NewState2, [?ELECTION_TIMEOUT]}
-      end;
-    _ when PrevLogIndex =:= 0 -> % nothing in the log yet
-      NewLog = maybe_delete_log(Log, PrevLogIndex+1, Term),
-      NewLog2 = raft_log:append_commands(NewLog, Entries, PrevLogIndex+1),
-      logger:debug("AppendEntries successfully commited", []),
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = true,
-                                            match_index = raft_log:last_index(NewLog2)}),
-      NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CommittedIndex, NewLog2),
-      NewState = State#state{current_term = Term,
-                             voted_for = undefined,
-                             log = NewLog2,
-                             cluster = raft_cluster:leader(Cluster, Leader),
-                             committed_index = NewCommitIndex},
-      NewState2 = maybe_apply_cluster_changes(Entries, maybe_apply(NewState)),
-      case StateName of
-        leader -> {next_state, follower, NewState2, [?ELECTION_TIMEOUT]};
-        _ -> {keep_state, NewState2, [?ELECTION_TIMEOUT]}
-      end;
-    _ = What ->
-      logger:notice("Previous log entry ~p not matched reply false -> ~p", [PrevLogIndex, What]),
-      % reply false, and step down
-      send_msg(Leader, #append_entries_resp{term = Term,
-                                            server = self(),
-                                            success = false,
-                                            match_index = raft_log:last_index(Log)}),
-      NewState = State#state{current_term = Term,
-                             cluster = raft_cluster:leader(Cluster, Leader)},
-      {keep_state, maybe_apply_cluster_changes(Entries, NewState), [?ELECTION_TIMEOUT]}
+  NewState =
+    case raft_log:get_term(Log, PrevLogIndex) of
+      {ok, PrevLogTerm} -> % log exists and the term matched
+        store_entries(AppendEntriesReq, State);
+      _ when PrevLogIndex =:= 0 -> % nothing in the log yet
+        store_entries(AppendEntriesReq, State);
+      _ = What ->
+        logger:notice("Previous log entry ~p not matched reply false -> ~p", [PrevLogIndex, What]),
+        % reply false, and step down
+        send_msg(Leader, #append_entries_resp{term = Term,
+                                              server = self(),
+                                              success = false,
+                                              match_index = raft_log:last_index(Log)}),
+        maybe_apply_cluster_changes(Entries,
+                                    State#state{current_term = Term,
+                                                cluster = raft_cluster:leader(Cluster, Leader)})
+    end,
+  case StateName of
+    leader -> {next_state, follower, NewState, [?ELECTION_TIMEOUT]};
+    _ -> {keep_state, NewState, [?ELECTION_TIMEOUT]}
   end;
 % ************************
 % handle vote requests
@@ -537,8 +477,8 @@ handle_event(info, #vote_req{term = Term, candidate = Candidate}, _StateName,
 %% Leader
 %% %%%%%%%%%%%%%%%
 handle_event(enter, _PrevStateName, leader, #state{cluster = Cluster, log = Log} = State) ->
-  logger:info("Become leader", []),
   set_logger_meta(#{raft_role => leader}),
+  logger:info("Become leader", []),
   NewCluster = raft_cluster:leader(Cluster, self()),
   NewState = State#state{cluster = NewCluster,
                          inner_state = #leader_state{peers = update_peers(#{}, NewCluster, Log)}},
@@ -755,7 +695,7 @@ maybe_apply(#state{last_applied = LastApplied, committed_index = CommittedIndex,
       maybe_apply(State#state{last_applied = CurrentIndex, cluster = JointCluster});
     {ok, {_Term, Command}} ->
       {_, NewState} = execute(Command, State),
-      maybe_apply(NewState#state{last_applied = CurrentIndex})
+      maybe_apply(maybe_store_snapshot(NewState#state{last_applied = CurrentIndex}))
   end;
 maybe_apply(State) ->
   State.
@@ -1014,7 +954,7 @@ commit_index(Server, State, Index, From) ->
   NewState2 = State#state{committed_index = Index},
   {ok, {_Term, Command}} = raft_log:get(State#state.log, Index),
   {Reply, NewState3} = execute(Command, NewState2),
-  NewState4 = NewState3#state{last_applied = Index},
+  NewState4 = maybe_store_snapshot(NewState3#state{last_applied = Index}),
   case Command of
     {?JOINT_CLUSTER_CHANGE, {_JointCluster, FinalCluster}} ->
       logger:info("Joint cluster change has replicated, switching to final config ~p",
@@ -1026,3 +966,36 @@ commit_index(Server, State, Index, From) ->
       gen_statem:reply(From, Reply),
       replicated(Server, Index, NewState4)
   end.
+
+maybe_store_snapshot(#state{log = Log, committed_index = CommittedIndex} = State) ->
+  %@TODO better log compaction trigger logic
+  NewLog = case CommittedIndex rem 10000 of
+              0 when CommittedIndex > 1 ->
+                % temporary disable
+                %raft_log:store_snapshot(Log, CommittedIndex, State#state.user_state);
+                Log;
+              _ ->
+                Log
+            end,
+  State#state{log = NewLog}.
+
+store_entries(#append_entries_req{term = Term,
+                                  leader = Leader,
+                                  entries = Entries,
+                                  prev_log_index = PrevLogIndex,
+                                  leader_commit_index = LeaderCommitIndex},
+              #state{committed_index = CommittedIndex, log = Log, cluster = Cluster} = State) ->
+  NextLogIndex = PrevLogIndex+1,
+  NewLog = maybe_delete_log(Log, NextLogIndex, Term),
+  NewLog2 = raft_log:append_commands(NewLog, Entries, NextLogIndex),
+  logger:debug("AppendEntries successfully commited on index ~p", [raft_log:last_index(NewLog2)]),
+  send_msg(Leader, #append_entries_resp{term = Term,
+                                        server = self(),
+                                        success = true,
+                                        match_index = raft_log:last_index(NewLog2)}),
+  NewCommitIndex = maybe_update_commit_index(LeaderCommitIndex, CommittedIndex, NewLog2),
+  NewState = State#state{current_term = Term,
+                         log = NewLog2,
+                         cluster = raft_cluster:leader(Cluster, Leader),
+                         committed_index = NewCommitIndex},
+  maybe_apply_cluster_changes(Entries, maybe_apply(NewState)).
