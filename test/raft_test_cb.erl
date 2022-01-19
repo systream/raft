@@ -13,7 +13,6 @@
 %% API
 -export([init/0, handle_command/2, handle_query/2]).
 
-
 -spec init() -> State when State :: term().
 init() ->
   #{}.
@@ -49,3 +48,4 @@ handle_command({register, Key, Pid}, State) ->
   Reply :: term().
 handle_query({get, Key}, State) ->
   maps:get(Key, State, 0).
+

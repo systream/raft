@@ -113,6 +113,8 @@
   success :: boolean()
 }).
 
+-callback get_log_module() -> module().
+
 -callback init() -> State when State :: term().
 
 -callback handle_command(Command, State) -> {Reply, State} when
@@ -124,6 +126,8 @@
   Command :: term(),
   State :: term(),
   Reply :: term().
+
+-optional_callbacks([get_log_module/0]).
 
 %%%===================================================================
 %%% API
@@ -185,8 +189,13 @@ call(Server, Command, Timeout) ->
 init(CallbackModule) ->
   erlang:process_flag(trap_exit, true),
   logger:info("Starting raft server with callback: ~p", [CallbackModule]),
+  Log = try
+          raft_log:new(apply(CallbackModule, get_log_module, []))
+        catch error:undef:_S ->
+          raft_log:new()
+        end,
   {ok, follower, init_user_state(#state{callback = CallbackModule,
-                                        log = raft_log:new(),
+                                        log = Log,
                                         cluster = raft_cluster:new()})}.
 
 -spec callback_mode() -> [handle_event_function | state_enter].

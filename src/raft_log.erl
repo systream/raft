@@ -11,7 +11,7 @@
 -define(INITIAL_TERM, 0).
 -define(INITIAL_INDEX, 0).
 
--export([new/0,
+-export([new/0, new/1,
          append/3, append_commands/3,
          destroy/1,
          last_index/1, last_term/1,

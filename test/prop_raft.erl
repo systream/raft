@@ -27,7 +27,6 @@ prop_test() ->
   ?FORALL(Cmds, commands(?MODULE),
           begin
             {History, State, Result} = run_commands(?MODULE, Cmds),
-            %[raft:stop(Pid) || Pid <- State#test_state.collaborators],
             ?WHENFAIL(
               begin
                 io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
@@ -46,27 +45,17 @@ initial_state() ->
 
 %% @doc List of possible commands to run against the system
 command(State) ->
+  On = oneof(State#test_state.collaborators),
   frequency([
-    {10, {call, raft, command, [oneof(State#test_state.collaborators), {store, store_key(), pos_integer()}]}},
-    {4, {call, raft, join, [oneof(State#test_state.collaborators), frequency([{10, new_member()},
-                                                                              {1, oneof(State#test_state.collaborators)}])]}},
-    {3, {call, raft, leave, [oneof(State#test_state.collaborators), oneof(State#test_state.collaborators)]}},
-    {1, {call, ?MODULE, kill_collaborator, [oneof(State#test_state.collaborators)]}},
-    {1, {call, ?MODULE, stop_collaborator, [oneof(State#test_state.collaborators)]}}
+    {10, {call, raft, command, [On, {store, store_key(), pos_integer()}]}}
+    %{4, {call, raft, join, [On, frequency([{10, new_member()}, {1, oneof(State#test_state.collaborators)}])]}},
+   % {3, {call, raft, leave, [On, oneof(State#test_state.collaborators)]}},
+   % {1, {call, ?MODULE, kill_collaborator, [oneof(State#test_state.collaborators)]}},
+   % {1, {call, ?MODULE, stop_collaborator, [oneof(State#test_state.collaborators)]}}
  ]).
 
 %% @doc Determines whether a command should be valid under the
 %% current state.
-%precondition(#test_state{collaborators = [_Item]}, {call, raft, leave, [_]}) ->
-%  false;
-%precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, kill_collaborator, [_]}) ->
-%  false;
-%precondition(#test_state{collaborators = [_Item]}, {call, ?MODULE, stop_collaborator, [_]}) ->
-%  false;
-%precondition(#test_state{}, {call, raft, command, _}) ->
-%  true;
-%precondition(#test_state{}, {call, raft, join, _}) ->
-%  true;
 precondition(#test_state{}, {call, _Mod, _Fun, _Args}) ->
   true.
 
@@ -89,33 +78,7 @@ postcondition(#test_state{storage = Storage, collaborators = Cluster} = _State,
     _ ->
       true
   end;
-postcondition(#test_state{} = _State, {call, raft, command, [_On, _]}, {error, no_leader}) ->
-  true;
-postcondition(#test_state{} = _State, {call, raft, command, [_On, _]}, {error, leader_changed}) ->
-  true;
-postcondition(_State, {call, raft, join, [_On, _]}, ok) ->
-  true;
-postcondition(_State, {call, raft, join, [_On, _]}, {error, no_leader}) ->
-  true;
-postcondition(_State, {call, raft, join, [_On, _]}, {error, leader_changed}) ->
-  true;
-postcondition(_State, {call, raft, join, [_On, _]}, {error, already_member}) ->
-  true;
-postcondition(_State, {call, raft, leave, [_On, _Target]}, ok) ->
-  true;
-postcondition(_State, {call, raft, leave, [_On, _Target]}, {error, not_member}) ->
-  true;
-postcondition(_State, {call, raft, leave, [_On, _Target]}, {error, no_leader}) ->
-  true;
-postcondition(_State, {call, raft, leave, [_On, _Target]}, {error, last_member_in_the_cluster}) ->
-  true;
-postcondition(_State, {call, ?MODULE, kill_collaborator, [_Pid]}, ok) ->
-  true;
-postcondition(_State, {call, ?MODULE, stop_collaborator, [_Pid]}, ok) ->
-  true;
-postcondition(_State, {call, _Mod, _Fun, _Args}, {'EXIT', {noproc, _}}) ->
-  true;
-postcondition(_State, {call, _Mod, _Fun, _Args}, {'EXIT', noproc}) ->
+postcondition(#test_state{} = _State, {call, raft, command, _}, {error, no_leader}) ->
   true;
 postcondition(_State, {call, _Mod, _Fun, _Args} = A, _Res) ->
   io:format("unhandled post condition: ~p~n~p~n", [A, _Res]),
@@ -131,22 +94,6 @@ next_state(#test_state{storage = Storage, collaborators = InCluster} = State, {o
     _ ->
       State
   end;
-
-next_state(#test_state{collaborators = InCluster} = State, _Result,
-           {call, raft, join, [_On, Target]}) ->
-  State#test_state{collaborators = [Target | InCluster]};
-
-next_state(#test_state{collaborators = InCluster} = State, ok,
-           {call, raft, leave, [_On, Target]}) ->
-  State#test_state{collaborators = lists:delete(Target, InCluster)};
-
-next_state(#test_state{collaborators = InCluster} = State, ok,
-           {call, ?MODULE, kill_collaborator, [Target]}) ->
-  State#test_state{collaborators = lists:delete(Target, InCluster)};
-
-next_state(#test_state{collaborators = InCluster} = State, ok,
-           {call, ?MODULE, stop_collaborator, [Target]}) ->
-  State#test_state{collaborators = lists:delete(Target, InCluster)};
 next_state(State, _Res, {call, _Mod, _Fun, _Args}) ->
   State.
 
@@ -179,11 +126,3 @@ setup_config() ->
                 maps:merge(OldMeta, Meta)
             end,
   logger:set_process_metadata(NewMeta).
-
-
-new_member() ->
-  ?LET(Wait, integer(0, 300), begin
-                                {ok, Pid} = raft:start(raft_test_cb),
-                                timer:sleep(Wait),
-                                Pid
-                              end).
