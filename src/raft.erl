@@ -11,7 +11,7 @@
 -export([start/1, stop/1,
          join/2, leave/2,
          status/1,
-         command/2, query/2]).
+         command/2, query/2, command/3]).
 
 -spec start(module()) -> {ok, pid()} | {error, term()}.
 start(Callback) ->
@@ -25,6 +25,11 @@ stop(Server) ->
   term().
 command(ClusterMember, Command) ->
   raft_server:command(ClusterMember, Command).
+
+-spec command(pid(), term(), binary()) ->
+  term().
+command(ClusterMember, Command, ReqId) ->
+  raft_server:command(ClusterMember, Command, ReqId).
 
 -spec query(pid(), term()) ->
   term().

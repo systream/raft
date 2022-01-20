@@ -8,4 +8,5 @@
 -type(raft_term() :: non_neg_integer()).
 -type(command() :: term()).
 -type(log_index() :: pos_integer()).
+-type(req_id() :: binary()).
 

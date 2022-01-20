@@ -12,6 +12,8 @@
 
 -include("raft.hrl").
 
+%@TODO in case of too many pending requests in flight add some delay to catch up.
+
 % election timeouts
 % erlang has monitors/links so do not really need timeouts, just in case.
 -define(MAX_HEARTBEAT_TIMEOUT, 10000).
@@ -29,7 +31,7 @@
 -export([start_link/1, stop/1,
          status/1,
          command/2, query/2,
-         join/2, leave/2]).
+         join/2, leave/2, command/3]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -157,7 +159,12 @@ leave(ClusterMember, MemberToLeave) ->
 -spec command(pid(), term()) ->
   term().
 command(ActualClusterMember, Command) ->
-  call(ActualClusterMember, {command, Command}, {dirty_timeout, 10000}).
+  command(ActualClusterMember, generate_req_id(), Command).
+
+-spec command(pid(), req_id(), term()) ->
+  term().
+command(ActualClusterMember, ReqId, Command) ->
+  call(ActualClusterMember, {command, ReqId, Command}, {dirty_timeout, 10000}).
 
 -spec query(pid(), term()) ->
   term().
@@ -210,8 +217,8 @@ format_status(_Opt, [_PDict, StateName, #state{current_term = CurrentTerm, clust
                                                committed_index = Ci, log = Log,
                                                last_applied = La}]) ->
   LastIndex = raft_log:last_index(Log),
-  LastLogEntries = [begin {ok, {Term, Command}} = raft_log:get(Log, Idx),
-                          {Idx, Term, Command}
+  LastLogEntries = [begin {ok, {Term, ReqId, Command}} = raft_log:get(Log, Idx),
+                          {Idx, Term, ReqId, Command}
                     end || Idx <- lists:seq(erlang:max(1, LastIndex-10), LastIndex)],
 
   {state, #{role => StateName,
@@ -501,8 +508,16 @@ handle_event(state_timeout, election_timeout, leader, State) ->
   NewState = send_heartbeat(State),
   {keep_state, NewState, [?ELECTION_TIMEOUT(get_min_timeout())]};
 
-handle_event({call, From}, {command, Command}, leader, State) ->
-  {keep_state, handle_command(From, Command, State), [?ELECTION_TIMEOUT(get_min_timeout())]};
+handle_event({call, From}, {command, ReqId, Command}, leader, #state{log = Log} = State) ->
+  case raft_log:is_logged(Log, ReqId) of
+    true ->
+      gen_statem:reply(From, {error, {request_already_append_to_log, ReqId}}),
+      {keep_state, State, [?ELECTION_TIMEOUT(get_min_timeout())]};
+    false ->
+      {keep_state,
+       handle_command(From, ReqId, Command, State),
+       [?ELECTION_TIMEOUT(get_min_timeout())]}
+  end;
 handle_event({call, From}, {query, Command}, leader, #state{callback = CB, user_state = Us}) ->
   gen_statem:reply(From, apply(CB, handle_query, [Command, Us])),
   keep_state_and_data;
@@ -511,7 +526,7 @@ handle_event({call, From}, {join, Server}, leader, #state{cluster = Cluster} = S
     {ok, NewCluster} ->
       logger:info("Join request for ~p server", [Server]),
       {keep_state,
-       handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster}, State),
+       handle_command(From, generate_req_id(), {?CLUSTER_CHANGE_COMMAND, NewCluster}, State),
        [?ELECTION_TIMEOUT(get_min_timeout())]};
     {error, _} = Error ->
       gen_statem:reply(From, Error),
@@ -523,7 +538,7 @@ handle_event({call, From}, {leave, Server}, leader,
     {ok, NewCluster} ->
       logger:info("Leave request for ~p server", [Server]),
       {keep_state,
-       handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster}, State),
+       handle_command(From, generate_req_id(), {?CLUSTER_CHANGE_COMMAND, NewCluster}, State),
        [?ELECTION_TIMEOUT(get_min_timeout())]};
     {error, _} = Error ->
       gen_statem:reply(From, Error),
@@ -548,7 +563,7 @@ handle_event(info, #append_entries_resp{} = AppendEntriesReq, leader, State) ->
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
 %% Proxy commands to leader
 %% %%%%%%%%%%%%%%%%%%%%%%%%%
-handle_event({call, From}, {command, _Command}, _StateName,
+handle_event({call, From}, {command, _ReqId, _Command}, _StateName,
              #state{cluster = Cluster}) ->
     gen_statem:reply(From, {error, {not_leader, raft_cluster:leader(Cluster)}}),
     keep_state_and_data;
@@ -698,18 +713,18 @@ maybe_apply(#state{last_applied = LastApplied, committed_index = CommittedIndex,
   when CommittedIndex > LastApplied ->
   CurrentIndex = LastApplied+1,
   case raft_log:get(Log, CurrentIndex) of
-    {ok, {_Term, {?CLUSTER_CHANGE, NewCluster}}} ->
+    {ok, {_Term, _ReqId, {?CLUSTER_CHANGE, NewCluster}}} ->
       maybe_apply(State#state{last_applied = CurrentIndex, cluster = NewCluster});
-    {ok, {_Term, {?JOINT_CLUSTER_CHANGE, {JointCluster, _FinalCluster}}}} ->
+    {ok, {_Term, _ReqId, {?JOINT_CLUSTER_CHANGE, {JointCluster, _FinalCluster}}}} ->
       maybe_apply(State#state{last_applied = CurrentIndex, cluster = JointCluster});
-    {ok, {_Term, Command}} ->
+    {ok, {_Term, _ReqId, Command}} ->
       {_, NewState} = execute(Command, State),
       maybe_apply(maybe_store_snapshot(NewState#state{last_applied = CurrentIndex}))
   end;
 maybe_apply(State) ->
   State.
 
-handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
+handle_command(From, ReqId, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
                #state{log = Log,
                       cluster = CurrentCluster,
                       current_term = Term,
@@ -720,7 +735,7 @@ handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
   JointCluster = raft_cluster:joint_cluster(CurrentCluster, NewCluster),
   FinalCluster = raft_cluster:increase_term(NewCluster),
   JointConsensusClusterChangeCommand = {?JOINT_CLUSTER_CHANGE, {JointCluster, FinalCluster}},
-  NewLog = raft_log:append(Log, JointConsensusClusterChangeCommand, Term),
+  NewLog = raft_log:append(Log, ReqId, JointConsensusClusterChangeCommand, Term),
   NewLeaderState = LeaderState#leader_state{peers = update_peers(Peers, JointCluster, NewLog)},
   NewState = State#state{log = NewLog, inner_state = NewLeaderState, cluster = JointCluster},
   NewState2 = send_append_reqs(NewState),
@@ -737,14 +752,14 @@ handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
                                                match_index = LogIndex,
                                                success = true},
   handle_append_entries_resp(SelfAppendEntriesResp, NewState2#state{inner_state = NewLeaderState2});
-handle_command(From, {?CLUSTER_CHANGE, NewCluster} = Command,
+handle_command(From, ReqId, {?CLUSTER_CHANGE, NewCluster} = Command,
                #state{log = Log,
                       current_term = Term,
                       inner_state = #leader_state{active_requests = CurrentRequests,
                                                   peers = Peers} = LeaderState
                } = State) ->
   logger:debug("Handling final cluster change: ~p", [Command]),
-  NewLog = raft_log:append(Log, {?CLUSTER_CHANGE, NewCluster}, Term),
+  NewLog = raft_log:append(Log, ReqId, {?CLUSTER_CHANGE, NewCluster}, Term),
   NewLeaderState = LeaderState#leader_state{peers = update_peers(Peers, NewCluster, NewLog)},
   NewState = State#state{log = NewLog, inner_state = NewLeaderState, cluster = NewCluster},
   NewState2 = send_append_reqs(NewState),
@@ -770,7 +785,7 @@ handle_command(From, {?CLUSTER_CHANGE, NewCluster} = Command,
       gen_statem:reply(From, ok),
       State#state{log = NewLog, inner_state = NewLeaderStateForLeader, cluster = NewClusterForLeader}
   end;
-handle_command(From, Command,
+handle_command(From, ReqId, Command,
                #state{log = Log,
                       current_term = Term,
                       cluster = Cluster,
@@ -778,7 +793,7 @@ handle_command(From, Command,
                } = State) ->
   logger:debug("Handling command: ~p", [Command]),
 
-  NewLog = raft_log:append(Log, Command, Term),
+  NewLog = raft_log:append(Log, ReqId, Command, Term),
   NewState = State#state{log = NewLog},
   NewState2 = send_append_reqs(NewState),
 
@@ -961,7 +976,7 @@ replicated_indexes(Requests, Index, Acc) ->
 
 commit_index(Server, State, Index, From) ->
   NewState2 = State#state{committed_index = Index},
-  {ok, {_Term, Command}} = raft_log:get(State#state.log, Index),
+  {ok, {_Term, _ReqId, Command}} = raft_log:get(State#state.log, Index),
   {Reply, NewState3} = execute(Command, NewState2),
   NewState4 = maybe_store_snapshot(NewState3#state{last_applied = Index}),
   case Command of
@@ -970,7 +985,7 @@ commit_index(Server, State, Index, From) ->
                   [FinalCluster]),
 
       NewState5 = replicated(Server, Index, NewState4),
-      handle_command(From, {?CLUSTER_CHANGE, FinalCluster}, NewState5);
+      handle_command(From, generate_req_id(), {?CLUSTER_CHANGE, FinalCluster}, NewState5);
     _ ->
       gen_statem:reply(From, Reply),
       replicated(Server, Index, NewState4)
@@ -1008,3 +1023,9 @@ store_entries(#append_entries_req{term = Term,
                          cluster = raft_cluster:leader(Cluster, Leader),
                          committed_index = NewCommitIndex},
   maybe_apply_cluster_changes(Entries, maybe_apply(NewState)).
+
+generate_req_id() ->
+  T = erlang:integer_to_binary(os:system_time()),
+  N = atom_to_binary(node()),
+  U = erlang:integer_to_binary(erlang:unique_integer([positive])),
+  <<"generated-", N/binary, "-", T/binary, "-", U/binary>>.
