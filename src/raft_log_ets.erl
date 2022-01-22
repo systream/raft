@@ -13,11 +13,11 @@
 -behavior(raft_log).
 
 %% API
--export([new/0, store/3, lookup/2, delete/2, destroy/1]).
+-export([new/1, store/3, lookup/2, delete/2, destroy/1]).
 
--spec new() -> State when State :: term().
-new() ->
-  ets:new(raft_log, [public, ordered_set, {keypos, 1}]).
+-spec new(binary() | undefined) -> State when State :: term().
+new(_ServerId) ->
+  {0, ets:new(raft_log, [public, ordered_set, {keypos, 1}])}.
 
 -spec store(State, log_index(), raft_log:log_entry()) -> State when State :: term().
 store(Ref, Index, Data) ->
