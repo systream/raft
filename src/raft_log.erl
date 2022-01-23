@@ -90,15 +90,17 @@ is_logged(#log_ref{bloom_ref = BloomRef} = Ref, ReqId) ->
 
 -spec is_req_logged(log_ref(), log_index(), req_id()) -> boolean().
 is_req_logged(Ref, Index, ReqId) ->
-  case get(Ref, Index) of
-    {ok, {_Term, ReqId, _Command}} ->
+  case get_callback(Ref, Index) of
+    {ok, #log_entry{req_id = ReqId}} ->
       true;
-    {ok, _} ->
+    {ok, #log_entry{}} ->
       is_req_logged(Ref, Index-1, ReqId);
-    {snapshot, _} ->
-      %@TODO
+    {ok, #snapshot_entry{bloom = Bloom}} ->
+      BloomRef = ebloom:deserialize(Bloom),
+      %%@TODO
       logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
-      false;
+      ebloom:contains(BloomRef, ReqId);
+      %false;
     not_found ->
       false
   end.
@@ -197,11 +199,11 @@ get_term(#log_ref{}, 0) ->
 get_term(#log_ref{last_index = Index, last_term = Term}, Index) ->
   {ok, Term};
 get_term(Log, Index) ->
-  case raft_log:get(Log, Index) of
-    {ok, {LTerm, _ReqId, _Command}} ->
-      {ok, LTerm};
-    {snapshot, {LTerm, _Index, _UserState}} ->
-      {ok, LTerm};
+  case get_callback(Log, Index) of
+    {ok, #log_entry{term = Term}} ->
+      {ok, Term};
+    {ok, #snapshot_entry{last_included_term = LastIncludedTerm}} ->
+      {ok, LastIncludedTerm};
     not_found ->
       no_term
   end.
@@ -209,8 +211,8 @@ get_term(Log, Index) ->
 -spec get(log_ref(), log_index()) ->
   {ok, {raft_term(), req_id(), command()}} |
   {snapshot, {raft_term(), log_index(), term()}} | not_found.
-get(#log_ref{data_ref = Ref, callback = Callback}, Index) ->
-  case apply(Callback, lookup, [Ref, Index]) of
+get(Ref, Index) ->
+  case get_callback(Ref, Index) of
     {ok, #log_entry{term = Term, req_id = ReqId, command = Command}} ->
       {ok, {Term, ReqId, Command}};
     {ok, #snapshot_entry{last_included_index = LastIncludedIndex,
@@ -221,6 +223,9 @@ get(#log_ref{data_ref = Ref, callback = Callback}, Index) ->
     not_found ->
       not_found
   end.
+
+get_callback(#log_ref{callback = Callback, data_ref = Ref}, Index) ->
+  apply(Callback, lookup, [Ref, Index]).
 
 -spec list(log_ref(), log_index(), pos_integer()) ->
   {ok, log_index(), list({term(), req_id(), command()})} |
