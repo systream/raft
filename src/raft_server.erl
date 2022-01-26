@@ -113,7 +113,6 @@
   success :: boolean()
 }).
 
-
 -record(install_snapshot_req, {
   term :: raft_term(),
   leader :: pid(),
@@ -122,7 +121,6 @@
   cluster :: raft_cluster:cluster(),
   user_state :: term()
 }).
-
 
 -callback get_log_module() -> module().
 -callback init() -> State when State :: term().
@@ -565,7 +563,7 @@ handle_event(enter, _PrevStateName, leader, #state{cluster = Cluster, log = Log}
   {keep_state, NewState2, [?ELECTION_TIMEOUT(get_min_timeout())]};
 handle_event(state_timeout, election_timeout, leader, State) ->
   NewState = send_heartbeat(State),
-  {keep_state, NewState, [?ELECTION_TIMEOUT(get_min_timeout())]};
+  {keep_state, NewState, [?ELECTION_TIMEOUT(get_idle_timeout())]};
 
 handle_event({call, From}, {command, ReqId, Command}, leader, #state{log = Log} = State) ->
   case raft_log:is_logged(Log, ReqId) of
@@ -712,6 +710,11 @@ get_consensus_timeout() ->
 
 get_min_timeout() ->
   application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT) + rand:uniform(5).
+
+get_idle_timeout() ->
+  Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
+  Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
+  (Min + (Max - Min) div 2) + rand:uniform(5).
 
 init_user_state(#state{callback = CallbackModule} = State) ->
   State#state{user_state = apply(CallbackModule, init, [])}.
@@ -1071,7 +1074,7 @@ commit_index(Server, State, Index, From) ->
 
 maybe_store_snapshot(#state{log = Log, last_applied = LastApplied} = State) ->
   %@TODO better log compaction trigger logic
-  NewLog = case LastApplied rem 10000 of
+  NewLog = case LastApplied rem 100000 of
               0 when LastApplied > 1 ->
                 raft_log:store_snapshot(Log, LastApplied, State#state.user_state);
                 %Log;

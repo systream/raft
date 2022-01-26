@@ -96,7 +96,7 @@ is_req_logged(Ref, Index, ReqId) ->
     {ok, #log_entry{}} ->
       is_req_logged(Ref, Index-1, ReqId);
     {ok, #snapshot_entry{bloom = Bloom}} ->
-      BloomRef = ebloom:deserialize(Bloom),
+      {ok, BloomRef} = ebloom:deserialize(Bloom),
       %%@TODO
       logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
       ebloom:contains(BloomRef, ReqId);
@@ -278,7 +278,7 @@ new_bloom(Index) ->
 maybe_upgrade_bloom(Index, BloomRef) when Index rem ?BLOOM_CHUNK_SIZE =:= 0 ->
   NewBloom = new_bloom(Index),
   logger:debug("Upgrading bloom filter at index ~p", [Index]),
-  ebloom:union(NewBloom, BloomRef),
+  ok = ebloom:union(NewBloom, BloomRef),
   NewBloom;
 maybe_upgrade_bloom(_Index, BloomRef) ->
   BloomRef.
