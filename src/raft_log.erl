@@ -11,7 +11,7 @@
 -define(INITIAL_TERM, 0).
 -define(INITIAL_INDEX, 0).
 
--define(BLOOM_CHUNK_SIZE, 100000).
+-define(BLOOM_CHUNK_SIZE, 10000).
 
 -export([new/0, new/2,
          append/4, append_commands/3,
@@ -105,7 +105,7 @@ is_req_logged(Ref, Index, ReqId) ->
       false
   end.
 
--spec last_index(log_ref()) -> log_index().
+-spec last_index(log_ref()) -> log_index() | 0.
 last_index(#log_ref{last_index = Pos}) ->
   Pos.
 
@@ -151,25 +151,17 @@ store_snapshot(#log_ref{data_ref = DataRef, callback = Cb, bloom_ref = BloomRef,
     state = UserState
   },
   logger:info("Storing snapshot for index ~p", [Index]),
-  NewRef = apply(Cb, store, [DataRef, Index, Snapshot]),
+  NewDataRef = apply(Cb, store, [DataRef, Index, Snapshot]),
   % cleanup
-  From = case LastSnapshotIndex of
-           undefined -> 1;
-           _ -> LastSnapshotIndex
-         end,
-  To = Index-1,
-  logger:debug("Cleanup indexes from ~p to ~p ", [From, To]),
-  NewRef2 = lists:foldl(fun(IndexToDel, R) ->
-    apply(Cb, delete, [R, IndexToDel])
-                        end, NewRef, lists:seq(From, To)),
-  Ref#log_ref{data_ref = NewRef2, last_snapshot_index = Index},
-    case Ref#log_ref.last_index < Index of
+  NewRef = maybe_cleanup(Ref#log_ref{data_ref = NewDataRef}, LastSnapshotIndex, Index),
+  case NewRef#log_ref.last_index =< Index of
     true ->
-      Ref#log_ref{data_ref = NewRef2, last_snapshot_index = Index,
-                  last_index = Index, last_term = LastSnapshotTerm,
-                  penultimate_term = undefined};
+      NewRef#log_ref{last_snapshot_index = Index,
+                     last_index = Index, last_term = LastSnapshotTerm,
+                     penultimate_term = undefined};
     _ ->
-      Ref#log_ref{data_ref = NewRef2, last_snapshot_index = Index}
+      NewRef#log_ref{last_snapshot_index = Index,
+                     penultimate_term = undefined}
   end.
 
 -spec store_snapshot(log_ref(), log_index(), term()) ->
@@ -271,7 +263,7 @@ destroy(#log_ref{data_ref = Ref, callback = Callback}) ->
 -spec new_bloom(log_index()) -> reference().
 new_bloom(Index) ->
   BloomChunkSize = (Index div ?BLOOM_CHUNK_SIZE) + (2*?BLOOM_CHUNK_SIZE),
-  {ok, BloomRef} = ebloom:new(BloomChunkSize, 0.001, rand:uniform(1000)),
+  {ok, BloomRef} = ebloom:new(BloomChunkSize, 0.001, rand:uniform(?BLOOM_CHUNK_SIZE)),
   BloomRef.
 
 -spec maybe_upgrade_bloom(log_index(), reference()) -> reference().
@@ -282,3 +274,16 @@ maybe_upgrade_bloom(Index, BloomRef) when Index rem ?BLOOM_CHUNK_SIZE =:= 0 ->
   NewBloom;
 maybe_upgrade_bloom(_Index, BloomRef) ->
   BloomRef.
+
+maybe_cleanup(Ref, undefined, Index) ->
+  maybe_cleanup(Ref, 1, Index);
+maybe_cleanup(Ref = #log_ref{data_ref = DataRef, callback = Cb}, From, Index)
+  when From =< Index-1 ->
+  To = Index-1,
+  logger:debug("Cleanup indexes from ~p to ~p ", [From, To]),
+  NewDataRef = lists:foldl(fun(IndexToDel, CDataRef) ->
+                             apply(Cb, delete, [CDataRef, IndexToDel])
+                           end, DataRef, lists:seq(From, To)),
+  Ref#log_ref{data_ref = NewDataRef};
+maybe_cleanup(Ref, _, _) ->
+  Ref.
