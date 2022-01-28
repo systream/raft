@@ -39,13 +39,14 @@ command(#state{log_ref = LogRef}) ->
         {4, {call, raft_log, delete, [LogRef, index()]}},
         {6, {call, raft_log, is_logged, [LogRef, req_id()]}},
         {4, {call, raft_log, get_term, [LogRef, index(), raft_term()]}},
-        {3, {call, raft_log, get, [LogRef, index()]}}
+        {3, {call, raft_log, get, [LogRef, index()]}}%,
+        %{2, {call, raft_log, list, [LogRef, index(), pos_integer()]}}
     ]).
 
 %% @doc Determines whether a command should be valid under the
 %% current state.
-precondition(_LogRef, {call, _Mod, _Fun, _Args}) ->
-    true.
+precondition(_LogRef, {call, _Mod, _Fun, _Args} = _A) ->
+  true.
 
 %% @doc Given the state `State' *prior* to the call
 %% `{call, Mod, Fun, Args}', determine whether the result
@@ -88,6 +89,12 @@ postcondition(#state{req_ids = _ReqIds},
 postcondition(#state{}, {call, raft_log, get_term, [_LogRef, _Index, _Def]}, _Result) ->
   true;
 postcondition(#state{}, {call, raft_log, get, [_LogRef, _Index]}, _Result) ->
+  true;
+postcondition(#state{}, {call, raft_log, list, [_LogRef, _Index, MaxChunk]},
+              {ok, _EndIndex, List}) ->
+  length(List) =< MaxChunk;
+postcondition(#state{}, {call, raft_log, list, [_LogRef, _Index, _MaxChunk]},
+              {snapshot, {_LastTerm, _LastIndex, _UserState}}) ->
   true.
 
 %% @doc Assuming the postcondition for a call was true, update the model
@@ -118,4 +125,4 @@ index() ->
   pos_integer().
 
 user_state() ->
-  map(binary(), oneof([map(binary(), binary()), binary()])).
+  resize(1, map(binary(), oneof([map(binary(), binary()), binary()]))).

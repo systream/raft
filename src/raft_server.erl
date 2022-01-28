@@ -154,11 +154,11 @@ status(ClusterMember) ->
 
 -spec join(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 join(ClusterMember, NewClusterMember) ->
-  call(ClusterMember, {join, NewClusterMember}, {clean_timeout, 3000}).
+  call(ClusterMember, {join, NewClusterMember}, {clean_timeout, 5000}).
 
 -spec leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 leave(ClusterMember, MemberToLeave) ->
-  call(ClusterMember, {leave, MemberToLeave}, {clean_timeout, 3000}).
+  call(ClusterMember, {leave, MemberToLeave}, {clean_timeout, 5000}).
 
 -spec command(pid(), term()) ->
   term().
@@ -425,14 +425,16 @@ handle_event(info, #install_snapshot_req{term = Term,
   #state{current_term = CurrentTerm, log = Log} = State)
   when Term > CurrentTerm ->
   logger:debug("Got install_snapshot_req with higher Term ~p > ~p", [Term, CurrentTerm]),
-  NewLog = raft_log:store_snapshot(Log, LastIndex, LastTerm, UserState),
-  NewState = State#state{user_state = UserState, log = NewLog,
+  NewLog1 = raft_log:delete(Log, LastIndex),
+  NewLog2 = raft_log:store_snapshot(NewLog1, LastIndex, LastTerm, UserState),
+
+  NewState = State#state{user_state = UserState, log = NewLog2,
                          last_applied = LastIndex, cluster = Cluster
   },
   send_msg(Leader, #append_entries_resp{term = Term,
                                         server = self(),
                                         success = true,
-                                        match_index = raft_log:last_index(NewLog)}),
+                                        match_index = raft_log:last_index(NewLog2)}),
   {next_state, follower, NewState#state{voted_for = undefined}, [?ELECTION_TIMEOUT]};
 
 handle_event(info, #install_snapshot_req{term = Term,
@@ -712,9 +714,10 @@ get_min_timeout() ->
   application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT) + rand:uniform(5).
 
 get_idle_timeout() ->
-  Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
   Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
-  (Min + (Max - Min) div 2) + rand:uniform(5).
+  GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
+  % now we hase 2x Grace to to send hb
+  (Max-GraceTime) + rand:uniform(5).
 
 init_user_state(#state{callback = CallbackModule} = State) ->
   State#state{user_state = apply(CallbackModule, init, [])}.

@@ -159,9 +159,11 @@ store_snapshot(#log_ref{data_ref = DataRef, callback = Cb, bloom_ref = BloomRef,
       NewRef#log_ref{last_snapshot_index = Index,
                      last_index = Index, last_term = LastSnapshotTerm,
                      penultimate_term = undefined};
-    _ ->
+    _ when LastSnapshotIndex =< Index ->
       NewRef#log_ref{last_snapshot_index = Index,
-                     penultimate_term = undefined}
+                     penultimate_term = undefined};
+    _ ->
+      NewRef#log_ref{penultimate_term = undefined}
   end.
 
 -spec store_snapshot(log_ref(), log_index(), term()) ->
@@ -248,6 +250,9 @@ delete(#log_ref{data_ref = Ref, last_index = LastIndex, callback = Callback} = L
   when LastIndex >= Index ->
     NewRef = apply(Callback, delete, [Ref, LastIndex]),
     delete(LogRef#log_ref{last_index = LastIndex-1, data_ref = NewRef}, Index);
+delete(#log_ref{last_snapshot_index = SnapShotIndex} = LogRef, Index)
+  when SnapShotIndex > Index andalso SnapShotIndex =/= undefined ->
+  delete(LogRef#log_ref{last_snapshot_index = undefined}, Index);
 delete(#log_ref{last_index = LastIndex} = LogRef, _Index) ->
   case get_term(LogRef, LastIndex) of
     {ok, LastTerm} ->

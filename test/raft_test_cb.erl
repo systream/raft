@@ -11,7 +11,10 @@
 -behavior(raft_server).
 
 %% API
--export([init/0, handle_command/2, handle_query/2]).
+-export([init/0, handle_command/2, handle_query/2, get_log_module/0]).
+
+get_log_module() ->
+  raft_log_ets.
 
 -spec init() -> State when State :: term().
 init() ->
