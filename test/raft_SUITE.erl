@@ -101,7 +101,7 @@ groups() ->
       , command_alone
       , command_cluster
       , join_cluster
-      , join_cluster_cross
+      %, join_cluster_cross
       , new_leader
       , catch_up
       , cluster_leave
@@ -109,6 +109,8 @@ groups() ->
       , not_able_to_server_without_majority_failure
       , parallel_joins
       , kill_the_leader_under_load
+      , with_tx_id_retry
+      , with_server_id
     ]}
   ].
 
@@ -199,9 +201,9 @@ join_cluster_cross(_Config) ->
   {ok, Slave1} = raft:start(raft_test_cb),
   {ok, Slave2} = raft:start(raft_test_cb),
 
-  logger:set_primary_config(level, debug),
-  retry_until({raft, join, [Slave1, Leader]}),
-  retry_until({raft, join, [Slave2, Leader]}),
+  ok = retry_until({raft, join, [Slave1, Leader]}),
+  ok = retry_until({raft, join, [Slave2, Leader]}),
+  timer:sleep(600),
 
   #{cluster_members := MembersL} = raft:status(Leader),
   #{cluster_members := MembersS1} = raft:status(Slave1),
@@ -260,26 +262,24 @@ cluster_leave(_Config) ->
   [raft:command(Leader, {hash, {test, I rem 5}, I}) || I <- lists:seq(1, 100)],
 
   ok = retry_until({raft, leave, [Slave1, Leader]}),
-  ?assertEqual( ok,
-                case retry_until({raft, leave, [Slave2, Leader]}) of
-                  {error, not_member} ->
-                    ok;
-                  {error, last_member_in_the_cluster} ->
-                    ok;
-                  Else ->
-                    Else
-                end),
-  ?assertEqual( ok,
-                case retry_until({raft, leave, [Leader, Leader]}) of
-                  {error, not_member} ->
-                    ok;
-                  {error, last_member_in_the_cluster} ->
-                    ok;
-                  Else ->
-                    Else
-                end),
+  EvalFun = fun(Result) ->
+              case Result of
+                {error, not_member} -> ok;
+                {error, last_member_in_the_cluster} -> ok;
+                Else -> Else
+              end
+            end,
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave2, Leader]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave2, Slave1]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave2, Slave2]}))),
 
-  ?assertEqual({error, last_member_in_the_cluster}, retry_until({raft, leave, [Slave1, Slave1]})),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Leader, Leader]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Leader, Slave1]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Leader, Slave2]}))),
+
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave1, Leader]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave1, Slave1]}))),
+  ?assertEqual(ok, EvalFun(retry_until({raft, leave, [Slave1, Slave2]}))),
 
   stop(Servers).
 
@@ -295,12 +295,11 @@ not_able_to_server_without_majority_failure(_Config) ->
   {ok, _} = raft:command(Leader, {hash, test, 1}),
   exit(Leader, kill),
   exit(S1, kill),
+  timer:sleep(1600),
   % both answer can be correct
   case retry_until({raft, command, [S2, {hash, test, 2}]}, 10) of
-    {'EXIT', {timeout, _}} ->
-      ok;
-    {error, no_leader} ->
-      ok
+    {'EXIT', {timeout, _}} -> ok;
+    {error, no_leader} -> ok
   end,
   stop(Servers).
 
@@ -335,6 +334,7 @@ parallel_joins(_Config) ->
 
 kill_the_leader_under_load(_Config) ->
   Servers = form_cluster(5),
+  timer:sleep(5),
   #{leader := Leader} = raft:status(hd(Servers)),
   spawn(fun() -> timer:sleep(10), exit(Leader, kill) end),
 
@@ -347,6 +347,18 @@ kill_the_leader_under_load(_Config) ->
   ?assertEqual(ok, compare_states(NewServers)),
 
   stop(Servers).
+
+with_tx_id_retry(_Config) ->
+  Servers = form_cluster(3),
+
+  {ok, _} = retry_until({raft, command, [pick_server(Servers), <<"test_txid">>, {hash, 1, 1}]}),
+  ?assertEqual({error, {req_id_already_appended_to_log, <<"test_txid">>}},
+               retry_until({raft, command, [pick_server(Servers), <<"test_txid">>, {hash, 1, 1}]})),
+  stop(Servers).
+
+with_server_id(_Config) ->
+  {ok, Pid} = raft:start(<<"id">>, raft_test_cb),
+  stop([Pid]).
 
 wait_until_leader(Pid) when is_pid(Pid) ->
   wait_until_leader([Pid]);
@@ -392,17 +404,19 @@ retry_until({M, F, A} = MFA, Times) ->
     {error, leader_changed} when Times > 0 ->
       timer:sleep(100),
       retry_until(MFA, Times-1);
+    {error, already_member} when  M =:= raft andalso F =:= join ->
+      ok;
     Else ->
       Else
   end.
 
 compare_logs(Servers) ->
-  io:format(user, "Comparing logs ~n", []),
+  ct:pal("Comparing logs ~n", []),
   LogRefs = get_log_refs(Servers),
   Leader = determine_leader(Servers),
   LeaderLa = last_log_index(Leader),
   compare_logs(LogRefs, 1, LeaderLa),
-  io:format(user, "Comparing done ~n", []),
+  ct:pal("Comparing done ~n", []),
   ok.
 
 compare_logs(Logs, Index, LeaderLa) when Index =< LeaderLa ->
@@ -411,22 +425,22 @@ compare_logs(Logs, Index, LeaderLa) when Index =< LeaderLa ->
     ok ->
       ok;
     diff ->
-      io:format(user, "Diff at: ~p -> ~p~n", [Index, LogResults])
+      ct:pal("Diff at: ~p -> ~p~n", [Index, LogResults])
   end,
   compare_logs(Logs, Index+1, LeaderLa);
 compare_logs(_, _, _) ->
   ok.
 
 compare_states(Servers) ->
-  io:format(user, "Comparing user states ~n", []),
+  ct:pal("Comparing user states ~n", []),
   UserStates = get_user_states(Servers),
   case do_compare_term([UserState || {_, UserState} <- UserStates]) of
     ok ->
       ok;
     diff ->
-      io:format(user, "Diff: ~p ~n", [UserStates])
+      ct:pal("Diff: ~p ~n", [UserStates])
   end,
-  io:format(user, "Comparing done ~n", []),
+  ct:pal("Comparing done ~n", []),
   ok.
 
 do_compare_term([Base | Rest]) ->
@@ -467,7 +481,7 @@ determine_leader([Server | RemServers]) ->
 wait_to_catch_up_follower(Servers) ->
   Leader = determine_leader(Servers),
   LeaderLa = last_log_index(Leader),
-  io:format(user, "Leader is ~p and last applied is: ~p~n", [Leader, LeaderLa]),
+  ct:pal("Leader is ~p and last applied is: ~p~n", [Leader, LeaderLa]),
   Followers = Servers -- [Leader],
   is_behind_check(Followers, LeaderLa, 100),
   ok.
@@ -475,7 +489,7 @@ wait_to_catch_up_follower(Servers) ->
 is_behind_check(Followers, LeaderLa, MaxWait) ->
   case is_behind(Followers, LeaderLa, false) of
     false ->
-      io:format(user, "Finally every follower has catched up~n", []),
+      ct:pal("Finally every follower has catched up~n", []),
       ok;
     true when MaxWait > 0 ->
       timer:sleep(100),
@@ -490,7 +504,7 @@ is_behind([Server | Servers], LeaderLa, Result) ->
   LastApplied = last_log_index(Server),
   case LastApplied < LeaderLa of
     true ->
-      io:format(user, "Server ~p is behind master ~p (~p ~p)~n",
+      ct:pal("Server ~p is behind master ~p (~p ~p)~n",
                 [Server, LeaderLa-LastApplied, LastApplied, LeaderLa]),
       is_behind(Servers, LeaderLa, true);
     false ->

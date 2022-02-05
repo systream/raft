@@ -81,7 +81,7 @@ new(ServerId, Callback) ->
   #log_ref{data_ref = Ref,
            last_index = LastIndex,
            last_term = LastTerm,
-           callback = Callback, bloom_ref = new_bloom(0)}.
+           callback = Callback, bloom_ref = new_bloom(1)}.
 
 -spec is_logged(log_ref(), req_id()) -> boolean().
 is_logged(#log_ref{bloom_ref = BloomRef} = Ref, ReqId) ->
@@ -257,7 +257,7 @@ list(#log_ref{last_index = LastIndex} = Log, FromIndex, MaxChunk) when FromIndex
 list(#log_ref{last_index = LastIndex}, _FromIndex, _MaxChunk) ->
   {ok, LastIndex, []}.
 
--spec get_list(log_ref(), log_index(), log_index(), list({term(), command()})) ->
+-spec get_list(log_ref(), log_index(), log_index(), list({term(), req_id(), command()})) ->
   list({term(), req_id(), command()}).
 get_list(Log, CurrentIndex, FromIndex, Acc) when CurrentIndex >= FromIndex ->
   {ok, Command} = get(Log, CurrentIndex),

@@ -26,15 +26,17 @@ prop_test() ->
   application:set_env(raft, heartbeat_grace_time, 50),
   put(raft_s, start_cluster()),
   ?FORALL(Cmds, commands(?MODULE),
-          begin
-            {History, State, Result} = run_commands(?MODULE, Cmds),
-            ?WHENFAIL(
+          ?TRAPEXIT(
               begin
-                io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
-              end,
-              aggregate(command_names(Cmds), Result =:= ok)
-            )
-          end).
+                {History, State, Result} = run_commands(?MODULE, Cmds),
+                ?WHENFAIL(
+                  begin
+                    io:format("History: ~p\nState: ~p\nResult: ~p\n", [History,State,Result])
+                  end,
+                  aggregate(command_names(Cmds), Result =:= ok)
+                )
+              end)
+          ).
 
 %%%%%%%%%%%%%
 %%% MODEL %%%
@@ -54,11 +56,11 @@ command(_State) ->
   On = oneof(get(raft_s)),
   frequency([
     {10, {call, raft, command, [On, {store, store_key(), pos_integer()}]}},
-    {5, {call, raft, query, [On, {get, store_key()}]}},
-    {3, {call, ?MODULE, join_member, [On, new_member()]}},
+    {5, {call, raft, query, [On, {get, store_key()}]}}%,
+    %{3, {call, ?MODULE, join_member, [On, new_member()]}}
    % {3, {call, raft, leave, [On, oneof(State#test_state.collaborators)]}},
    % {1, {call, ?MODULE, kill_collaborator, [oneof(State#test_state.collaborators)]}},
-    {1, {call, ?MODULE, stop_collaborator, [On, ?SUCHTHAT(S, oneof(get(raft_s)), S =/= On)]}}
+    %{1, {call, ?MODULE, stop_collaborator, [On, ?SUCHTHAT(S, oneof(get(raft_s)), S =/= On)]}}
  ]).
 
 %% @doc Determines whether a command should be valid under the

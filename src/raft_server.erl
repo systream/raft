@@ -41,7 +41,7 @@
 
 -define(SERVER, ?MODULE).
 
--type(state_name() :: follower | candidate | leader).
+%-type(state_name() :: follower | candidate | leader).
 
 -record(follower_state, {}).
 
@@ -200,7 +200,7 @@ call(Server, Command, Timeout) ->
 %%% gen_statem callbacks
 %%%===================================================================
 
--spec init(module()) -> {ok, follower, state()}.
+-spec init({binary(), module()}) -> {ok, follower, state()}.
 init({ServerId, CallbackModule}) ->
   erlang:process_flag(trap_exit, true),
   logger:info("Starting raft server with id: ~p, callback: ~p", [ServerId, CallbackModule]),
@@ -574,7 +574,7 @@ handle_event(state_timeout, election_timeout, leader, State) ->
 handle_event({call, From}, {command, ReqId, Command}, leader, #state{log = Log} = State) ->
   case raft_log:is_logged(Log, ReqId) of
     true ->
-      gen_statem:reply(From, {error, {request_already_append_to_log, ReqId}}),
+      gen_statem:reply(From, {error, {req_id_already_appended_to_log, ReqId}}),
       {keep_state, State, [?ELECTION_TIMEOUT(get_min_timeout())]};
     false ->
       {keep_state,
@@ -654,23 +654,18 @@ handle_event(info, {'EXIT', Server, _Reason}, _StateName, #state{cluster = Clust
       % if the leader died, start new consensus
       case Server =:= raft_cluster:leader(Cluster) of
         true ->
-          logger:error("Cluster leader ~p died", [Server]),
-          % all servers might got this message at almost same time,
+          logger:warning("Cluster leader ~p died", [Server]),
+          % all servers might got this message at almost the same time,
           % to give more chance for a success leader election wait random
           timer:sleep(rand:uniform(50)),
           {next_state, candidate, State#state{cluster = raft_cluster:leader(Cluster, undefined)}};
         _ ->
-          logger:error("Cluster member ~p died", [Server]),
+          logger:warning("Cluster member ~p died", [Server]),
           keep_state_and_data
       end;
     _ ->
       keep_state_and_data
   end.
-%;
-%handle_event(EventType, EventContent, StateName, #state{} = State) ->
-%  logger:warning("Unhandled event: Et: ~p Ec: ~p~nSt: ~p Sn: ~p~n",
-%                 [StateName, EventType, EventContent, State, StateName]),
-%  keep_state_and_data.
 
 %% @private
 %% @doc This function is called by a gen_statem when it is about to
@@ -703,7 +698,6 @@ send_append_reqs(#state{log = Log, current_term = Term, committed_index = Commit
 
 get_timeout() ->
   Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
-  %Min = application:get_env(raft, min_heartbeat_timeout, ?MIN_HEARTBEAT_TIMEOUT),
   GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
   Rand = rand:uniform(GraceTime),
   Max-Rand+GraceTime.
@@ -720,7 +714,7 @@ get_min_timeout() ->
 get_idle_timeout() ->
   Max = application:get_env(raft, max_heartbeat_timeout, ?MAX_HEARTBEAT_TIMEOUT),
   GraceTime = application:get_env(raft, heartbeat_grace_time, ?HEARTBEAT_GRACE_TIME),
-  % now we hase 2x Grace to to send hb
+  % now we have 2x grace to to send hb
   (Max-GraceTime) + rand:uniform(5).
 
 init_user_state(#state{callback = CallbackModule} = State) ->
@@ -733,7 +727,7 @@ execute({?JOINT_CLUSTER_CHANGE, {_JointCluster, _FinalCluster}}, State) ->
 execute(Command, #state{callback = CallbackModule, user_state = UserState} = State) ->
   logger:debug("Execute log command ~p", [Command]),
   % @TODO: while apply command gen_server should be able to respond
-  % (execute command might take awhile, in worst case more than heartbeat timeout)
+  % (execute command might take a while, in worst case more than heartbeat timeout)
   case apply(CallbackModule, handle_command, [Command, UserState]) of
     {Reply, NewUserState} ->
       {Reply, State#state{user_state = NewUserState}}

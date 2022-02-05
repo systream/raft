@@ -1,5 +1,7 @@
 -module(prop_raft_log).
 -include_lib("proper/include/proper.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
 
 %% Model Callbacks
 -export([command/1, initial_state/0, next_state/3,
@@ -15,14 +17,16 @@
 %%%%%%%%%%%%%%%%%%
 prop_test() ->
     ?FORALL(Cmds, commands(?MODULE),
-            begin
-                application:ensure_all_started(raft),
-                {History, State, Result} = run_commands(?MODULE, Cmds),
-                raft_log:destroy(State#state.log_ref),
-                ?WHENFAIL(io:format("History: ~p\nState: ~p\nResult: ~p\n",
-                                    [History,State,Result]),
-                          aggregate(command_names(Cmds), Result =:= ok))
-            end).
+            ?TRAPEXIT(
+              begin
+                  application:ensure_all_started(raft),
+                  {History, State, Result} = run_commands(?MODULE, Cmds),
+                  raft_log:destroy(State#state.log_ref),
+                  ?WHENFAIL(io:format("History: ~p\nState: ~p\nResult: ~p\n",
+                                      [History,State,Result]),
+                            aggregate(command_names(Cmds), Result =:= ok))
+              end)
+            ).
 
 %%%%%%%%%%%%%
 %%% MODEL %%%
@@ -33,15 +37,28 @@ initial_state() ->
 
 %% @doc List of possible commands to run against the system
 command(#state{log_ref = LogRef}) ->
-    frequency([
-        {10, {call, raft_log, append, [LogRef, req_id(), command(), raft_term()]}},
-        {5, {call, raft_log, store_snapshot, [LogRef, index(), user_state()]}},
-        {4, {call, raft_log, delete, [LogRef, index()]}},
-        {6, {call, raft_log, is_logged, [LogRef, req_id()]}},
-        {4, {call, raft_log, get_term, [LogRef, index(), raft_term()]}},
-        {3, {call, raft_log, get, [LogRef, index()]}}%,
-        %{2, {call, raft_log, list, [LogRef, index(), pos_integer()]}}
-    ]).
+  Commands = [
+      {10, {call, raft_log, append, [LogRef, req_id(), command(), raft_term()]}}
+    %, {5, {call, raft_log, store_snapshot, [LogRef, index(), user_state()]}}
+    , {4, {call, raft_log, delete, [LogRef, index()]}}
+    , {6, {call, raft_log, is_logged, [LogRef, req_id()]}}
+    , {4, {call, raft_log, get_term, [LogRef, index(), raft_term()]}}
+    , {3, {call, raft_log, get, [LogRef, index()]}}
+      %, {2, {call, raft_log, list, [LogRef, index(), pos_integer()]}}
+  ],
+
+  %LastIndex = raft_log:last_index(LogRef),
+
+  %NewCommands =
+  %  case LastIndex >= 1 of
+  %    true ->
+  %      [{5, {call, raft_log, store_snapshot, [LogRef,?SUCHTHAT(Idx, index(), begin Idx =<LastIndex end), user_state()]}} |
+  %       Commands];
+  %    _ ->
+  %      Commands
+  %  end,
+  frequency(Commands).
+
 
 %% @doc Determines whether a command should be valid under the
 %% current state.
@@ -62,13 +79,13 @@ postcondition(#state{log_ref = LogRefState},
   raft_log:is_logged(NewLogRef, ReqId) =:= true andalso
   raft_log:next_index(NewLogRef) =:= LastIndex+1;
 postcondition(_State,
-              {call, raft_log, store_snapshot, [_LogRef, Index, RaftTerm, UserState]},
+              {call, raft_log, store_snapshot, [_LogRef, Index, UserState]},
               NewLogRef) ->
   {snapshot, {LastIncludedTerm, LastIncludedIndex, SnUserState}} = raft_log:get(NewLogRef, Index),
   {ok, GTTerm} = raft_log:get_term(NewLogRef, Index),
-  LastIncludedTerm =:= RaftTerm andalso
+  %LastIncludedTerm =:= RaftTerm andalso
   GTTerm =:= LastIncludedTerm andalso
-  GTTerm =:= RaftTerm andalso
+  %GTTerm =:= RaftTerm andalso
   LastIncludedIndex =:= Index andalso
   SnUserState =:= UserState;
 postcondition(_State,
