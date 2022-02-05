@@ -1118,6 +1118,6 @@ store_entries(#append_entries_req{term = Term,
 
 generate_req_id() ->
   T = erlang:integer_to_binary(os:system_time()),
-  N = atom_to_binary(node()),
+  N = erlang:atom_to_binary(node(), utf8),
   U = erlang:integer_to_binary(erlang:unique_integer([positive])),
   <<"generated-", N/binary, "-", T/binary, "-", U/binary>>.
