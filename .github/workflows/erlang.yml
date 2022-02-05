@@ -21,7 +21,7 @@ jobs:
     - name: Run tests
       run: rebar3 test
 
- build-23:
+  build-23:
     runs-on: ubuntu-latest
 
     container:
@@ -35,7 +35,7 @@ jobs:
       run: rebar3 test
 
 
- build-latest:
+  build-latest:
     runs-on: ubuntu-latest
 
     container:
@@ -47,5 +47,3 @@ jobs:
       run: rebar3 compile
     - name: Run tests
       run: rebar3 test
-
-
