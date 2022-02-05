@@ -17,8 +17,13 @@
          append/4, append_commands/3,
          destroy/1,
          last_index/1, last_term/1,
-         get/2, delete/2, get_term/3, list/3,
-         next_index/1, get_term/2, store_snapshot/3, is_logged/2, store_snapshot/4]).
+         get_term/3, get_term/2,
+         get/2,
+         delete/2,
+         list/3,
+         next_index/1,
+         store_snapshot/3, store_snapshot/5,
+         is_logged/2]).
 
 -record(log_ref, {data_ref :: term(),
                   bloom_ref :: reference(),
@@ -90,14 +95,14 @@ is_logged(#log_ref{bloom_ref = BloomRef} = Ref, ReqId) ->
 
 -spec is_req_logged(log_ref(), log_index(), req_id()) -> boolean().
 is_req_logged(Ref, Index, ReqId) ->
-  case get_callback(Ref, Index) of
+  case get_by_callback(Ref, Index) of
     {ok, #log_entry{req_id = ReqId}} ->
       true;
     {ok, #log_entry{}} ->
       is_req_logged(Ref, Index-1, ReqId);
     {ok, #snapshot_entry{bloom = Bloom}} ->
       {ok, BloomRef} = ebloom:deserialize(Bloom),
-      %%@TODO
+      %% @TODO deal with this
       logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
       ebloom:contains(BloomRef, ReqId);
       %false;
@@ -139,15 +144,15 @@ append_commands(#log_ref{last_index = LastIndex} = Log,
       append_commands(append(Log, ReqId, Command, Term), RestCommands, Index+1)
   end.
 
--spec store_snapshot(log_ref(), log_index(), raft_term(), term()) ->
+-spec store_snapshot(log_ref(), log_index(), raft_term(), binary(), term()) ->
   log_ref().
-store_snapshot(#log_ref{data_ref = DataRef, callback = Cb, bloom_ref = BloomRef,
+store_snapshot(#log_ref{data_ref = DataRef, callback = Cb,
                         last_snapshot_index = LastSnapshotIndex} = Ref,
-               Index, LastSnapshotTerm, UserState) ->
+               Index, LastSnapshotTerm, Bloom, UserState) ->
   Snapshot = #snapshot_entry{
     last_included_index = Index,
     last_included_term = LastSnapshotTerm,
-    bloom = ebloom:serialize(BloomRef),
+    bloom = Bloom,
     state = UserState
   },
   logger:info("Storing snapshot for index ~p", [Index]),
@@ -156,10 +161,12 @@ store_snapshot(#log_ref{data_ref = DataRef, callback = Cb, bloom_ref = BloomRef,
   NewRef = maybe_cleanup(Ref#log_ref{data_ref = NewDataRef}, LastSnapshotIndex, Index),
   case NewRef#log_ref.last_index =< Index of
     true ->
+      {ok, BloomRef} = ebloom:deserialize(Bloom),
       NewRef#log_ref{last_snapshot_index = Index,
                      last_index = Index, last_term = LastSnapshotTerm,
+                     bloom_ref = BloomRef,
                      penultimate_term = undefined};
-    _ when LastSnapshotIndex =< Index ->
+    _ when LastSnapshotIndex =< Index orelse LastSnapshotIndex =:= undefined ->
       NewRef#log_ref{last_snapshot_index = Index,
                      penultimate_term = undefined};
     _ ->
@@ -173,7 +180,23 @@ store_snapshot(#log_ref{last_snapshot_index = LastSnapshotIndex} = Ref, Index, _
   Ref;
 store_snapshot(Ref, Index, UserState) ->
   {ok, LastSnapshotTerm} = get_term(Ref, Index),
-  store_snapshot(Ref, Index, LastSnapshotTerm, UserState).
+  store_snapshot(Ref, Index, LastSnapshotTerm, bloom_at_index(Ref, Index), UserState).
+
+-spec bloom_at_index(log_ref(), log_index()) -> binary().
+bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = Index}, Index) ->
+  ebloom:serialize(BloomRef);
+bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = LastIndex} = Ref, Index) ->
+  % Copy current bloom
+  {ok, CloneBloom} = ebloom:deserialize(ebloom:serialize(BloomRef)),
+  % build a bloom with the difference
+  {ok, DiffBloomRef} = ebloom:new(LastIndex-Index, 0.0001, rand:uniform(1000)),
+  lists:foreach(fun(DIndex) ->
+                  {ok, {_Term, ReqId, _Command}} = get(Ref, DIndex),
+                  ebloom:insert(DiffBloomRef, ReqId)
+                end, lists:seq(Index, LastIndex)),
+  ebloom:difference(CloneBloom, DiffBloomRef),
+  ebloom:serialize(CloneBloom).
+
 
 -spec get_term(log_ref(), log_index() | 0, term()) -> raft_term().
 get_term(LogRef, Index, DefaultTerm) ->
@@ -193,7 +216,7 @@ get_term(#log_ref{}, 0) ->
 get_term(#log_ref{last_index = Index, last_term = Term}, Index) ->
   {ok, Term};
 get_term(Log, Index) ->
-  case get_callback(Log, Index) of
+  case get_by_callback(Log, Index) of
     {ok, #log_entry{term = Term}} ->
       {ok, Term};
     {ok, #snapshot_entry{last_included_term = LastIncludedTerm}} ->
@@ -204,26 +227,27 @@ get_term(Log, Index) ->
 
 -spec get(log_ref(), log_index()) ->
   {ok, {raft_term(), req_id(), command()}} |
-  {snapshot, {raft_term(), log_index(), term()}} | not_found.
+  {snapshot, {raft_term(), log_index(), binary(), term()}} | not_found.
 get(Ref, Index) ->
-  case get_callback(Ref, Index) of
+  case get_by_callback(Ref, Index) of
     {ok, #log_entry{term = Term, req_id = ReqId, command = Command}} ->
       {ok, {Term, ReqId, Command}};
     {ok, #snapshot_entry{last_included_index = LastIncludedIndex,
                          last_included_term = LastIncludedTerm,
-                         %bloom = Bloom,
+                         bloom = Bloom,
                          state = UserState}} ->
-      {snapshot, {LastIncludedTerm, LastIncludedIndex, UserState}};
+      {snapshot, {LastIncludedTerm, LastIncludedIndex, Bloom, UserState}};
     not_found ->
       not_found
   end.
 
-get_callback(#log_ref{callback = Callback, data_ref = Ref}, Index) ->
+-spec get_by_callback(log_ref(), log_index()) -> {ok, log_entry() | snapshot_entry()} | not_found.
+get_by_callback(#log_ref{callback = Callback, data_ref = Ref}, Index) ->
   apply(Callback, lookup, [Ref, Index]).
 
 -spec list(log_ref(), log_index(), pos_integer()) ->
   {ok, log_index(), list({term(), req_id(), command()})} |
-  {snapshot, {raft_term(), log_index(), term()}}.
+  {snapshot, {raft_term(), log_index(), binary(), term()}}.
 list(#log_ref{last_snapshot_index = SnapshotIndex} = Log, FromIndex, _MaxChunk)
   when FromIndex =< SnapshotIndex andalso SnapshotIndex =/= undefined ->
   {snapshot, _} = get(Log, SnapshotIndex);

@@ -119,6 +119,7 @@
   last_included_index :: log_index() | 0,
   last_included_term :: raft_term(),
   cluster :: raft_cluster:cluster(),
+  bloom :: binary(),
   user_state :: term()
 }).
 
@@ -176,7 +177,7 @@ query(ActualClusterMember, Command) ->
   call(ActualClusterMember, {query, Command}, {dirty_timeout, 10000}).
 
 call(Server, Command, Timeout) ->
-  % @TODO store leader in pd?!
+  % @TODO store leader in pd to save one call?!
   case catch gen_statem:call(Server, Command, Timeout) of
     {error, {not_leader, undefined}} ->
       %erase({?MODULE, leader, Server}),
@@ -206,7 +207,7 @@ init({ServerId, CallbackModule}) ->
   Log = try
           raft_log:new(ServerId, apply(CallbackModule, get_log_module, []))
         catch error:undef:_S ->
-          raft_log:new(ServerId)
+          raft_log:new(ServerId, raft_log_ets)
         end,
   {ok, follower, init_user_state(#state{callback = CallbackModule,
                                         log = Log,
@@ -420,13 +421,14 @@ handle_event(info, #install_snapshot_req{term = Term,
                                          last_included_index = LastIndex,
                                          last_included_term = LastTerm,
                                          cluster = Cluster,
+                                         bloom = Bloom,
                                          user_state = UserState},
              _StateName,
   #state{current_term = CurrentTerm, log = Log} = State)
   when Term > CurrentTerm ->
   logger:debug("Got install_snapshot_req with higher Term ~p > ~p", [Term, CurrentTerm]),
   NewLog1 = raft_log:delete(Log, LastIndex),
-  NewLog2 = raft_log:store_snapshot(NewLog1, LastIndex, LastTerm, UserState),
+  NewLog2 = raft_log:store_snapshot(NewLog1, LastIndex, LastTerm, Bloom, UserState),
 
   NewState = State#state{user_state = UserState, log = NewLog2,
                          last_applied = LastIndex, cluster = Cluster
@@ -442,17 +444,19 @@ handle_event(info, #install_snapshot_req{term = Term,
                                          last_included_index = LastIndex,
                                          last_included_term = LastTerm,
                                          cluster = Cluster,
+                                         bloom = Bloom,
                                          user_state = UserState}, StateName,
   #state{current_term = Term, log = Log} = State) ->
   logger:debug("Got install_snapshot_req", []),
-  NewLog = raft_log:store_snapshot(Log, LastIndex, LastTerm, UserState),
-  NewState = State#state{user_state = UserState, log = NewLog,
+  NewLog1 = raft_log:delete(Log, LastIndex),
+  NewLog2 = raft_log:store_snapshot(NewLog1, LastIndex, LastTerm, Bloom, UserState),
+  NewState = State#state{user_state = UserState, log = NewLog2,
                          last_applied = LastIndex, cluster = Cluster
   },
   send_msg(Leader, #append_entries_resp{term = Term,
                                         server = self(),
                                         success = true,
-                                        match_index = raft_log:last_index(NewLog)}),
+                                        match_index = raft_log:last_index(NewLog2)}),
   case StateName of
     leader -> {next_state, follower, NewState, [?ELECTION_TIMEOUT]};
     _ -> {keep_state, NewState, [?ELECTION_TIMEOUT]}
@@ -638,10 +642,10 @@ handle_event({call, From}, {Type, _Node}, _StateName,
 
 % not leader, can be dropped?
 handle_event(info, #append_entries_resp{server = Server}, _StateName, _State) ->
-  logger:warning("Got unhandled append entries response from ~p, dropped", [Server]),
+  logger:notice("Got unhandled append entries response from ~p, dropped", [Server]),
   keep_state_and_data;
 handle_event(info, #vote_req_reply{} = Vrp, _StateName, _State) ->
-  logger:warning("Got unhandled vote_req_reply, dropped ~p ", [Vrp]),
+  logger:notice("Got unhandled vote_req_reply, dropped ~p ", [Vrp]),
   keep_state_and_data;
 
 handle_event(info, {'EXIT', Server, _Reason}, _StateName, #state{cluster = Cluster} = State) ->
@@ -881,21 +885,18 @@ handle_command(From, ReqId, Command,
 handle_append_entries_resp(#append_entries_resp{success = true,
                                                 server = Server,
                                                 match_index = MatchIndex},
-                           #state{inner_state = #leader_state{active_requests = ActiveRequests} = InnerState,
-                                  %cluster = Cluster,
-                                  committed_index = CommittedIndex
+                           #state{inner_state = #leader_state{active_requests = ActiveRequests} = InnerState
                           } = State) ->
   logger:debug("Got positive append_entries_resp from ~p with match_index ~p",
                [Server, MatchIndex]),
 
-  case handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) of
+  case handle_request(Server, ActiveRequests, MatchIndex) of
     {replicated, NewActiveRequests, IndexesToCommit} ->
 
       NewInnerState = InnerState#leader_state{active_requests = NewActiveRequests},
       NewState = State#state{inner_state = NewInnerState},
 
-
-      lists:foldl(fun({Index, From}, CState) ->
+      lists:foldr(fun({Index, From}, CState) ->
                     commit_index(Server, CState, Index, From)
                   end,
                   NewState, IndexesToCommit);
@@ -963,15 +964,15 @@ send_append_req(Peer, Log, Term, CommittedIndex, Cluster) ->
                                              leader_commit_index = CommittedIndex},
       send_msg(Server, AppendEntriesReq),
       raft_peer:next_index(Peer, EndIndex+1);
-    {snapshot, {SnapshotLastTerm, LastLogIndex, UserState}} ->
+    {snapshot, {SnapshotLastTerm, LastLogIndex, Bloom, UserState}} ->
       logger:debug("Send install snapshot req to ~p last_index: ~p last_term: ~p",
                    [Server, LastLogIndex, SnapshotLastTerm]),
-
       SnapshotReq = #install_snapshot_req{term = Term,
                                           leader = self(),
                                           last_included_index = LastLogIndex,
                                           last_included_term = SnapshotLastTerm,
                                           cluster = Cluster,
+                                          bloom = Bloom,
                                           user_state = UserState},
       send_msg(Server, SnapshotReq),
       raft_peer:next_index(Peer, LastLogIndex+1)
@@ -1023,7 +1024,7 @@ replicated(Server, MatchIndex,
       State#state{inner_state = LeaderState#leader_state{peers = Peers#{Server => NewPeer2}}}
   end.
 
-handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) ->
+handle_request(Server, ActiveRequests, MatchIndex) ->
   case maps:get(MatchIndex, ActiveRequests, no_request) of
     no_request ->
       logger:debug("No active request found for index ~p",  [MatchIndex]),
@@ -1036,7 +1037,7 @@ handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) ->
                       end,
       NewActiveRequest = ActiveRequest#request{replicated = NewReplicated},
       NewActiveRequests = ActiveRequests#{MatchIndex => NewActiveRequest},
-      case replicated_indexes(NewActiveRequests, CommittedIndex+1, []) of
+      case replicated_indexes(NewActiveRequests, MatchIndex) of
         {UpdatedNewActiveRequest, []} ->
           UpdatedNewActiveRequest;
         {UpdatedNewActiveRequest, IndexesToCommit} ->
@@ -1044,18 +1045,31 @@ handle_request(Server, ActiveRequests, MatchIndex, CommittedIndex) ->
       end
   end.
 
+replicated_indexes(Requests, Index) ->
+  replicated_indexes(Requests, Index, []).
+
 replicated_indexes(Requests, Index, Acc) ->
   case maps:get(Index, Requests, not_found) of
-    #request{replicated = Replicated, majority = Majority, from = From}
+    #request{replicated = Replicated, majority = Majority}
       when length(Replicated) >= Majority ->
       logger:debug("Majority of the logs are successfully replicated for index ~p", [Index]),
-      NewRequests = maps:remove(Index, Requests),
-      replicated_indexes(NewRequests, Index+1, [{Index, From} | Acc]);
+      % Clean all the lower indexes because if have majority replicated all the lower
+      % requests surely replicated
+      {NewRequests, NewAcc} = clean_requests(Index, Requests, Acc),
+      replicated_indexes(NewRequests, Index+1, NewAcc);
     not_found when map_size(Requests) > 0 ->
       NextActiveRequestIndex = lists:min(maps:keys(Requests)),
       replicated_indexes(Requests, NextActiveRequestIndex, Acc);
     _  ->
       {Requests, lists:reverse(Acc)}
+  end.
+
+clean_requests(Index, Request, Acc) ->
+  case maps:get(Index, Request, not_found) of
+    not_found ->
+      {Request, Acc};
+    #request{from = From} ->
+      clean_requests(Index-1, maps:remove(Index, Request), [{Index, From} | Acc])
   end.
 
 commit_index(Server, State, Index, From) ->
@@ -1077,7 +1091,8 @@ commit_index(Server, State, Index, From) ->
 
 maybe_store_snapshot(#state{log = Log, last_applied = LastApplied} = State) ->
   %@TODO better log compaction trigger logic
-  NewLog = case LastApplied rem 100000 of
+  SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, 100000),
+  NewLog = case LastApplied rem SnapshotChunkSize of
               0 when LastApplied > 1 ->
                 raft_log:store_snapshot(Log, LastApplied, State#state.user_state);
                 %Log;

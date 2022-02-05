@@ -25,6 +25,10 @@ init() ->
   State :: term(),
   Reply :: term().
 handle_command({store, Key, Value}, State) ->
+  NewState = State#{Key => Value},
+  %io:format(user, "[~p] store ~p -> ~p Newtate: ~p~n", [self(), Key, Value, NewState]),
+  {ok, NewState};
+handle_command({increment, Key, Value}, State) ->
   NewValue = maps:get(Key, State, 0)+Value,
   {{ok, NewValue}, State#{Key => NewValue}};
 handle_command({hash, Key, Value}, State) ->
@@ -33,6 +37,8 @@ handle_command({hash, Key, Value}, State) ->
   {{ok, NewValue}, State#{Key => NewValue}};
 handle_command(noop, State) ->
   {ok, State};
+handle_command(clear_state, _State) ->
+  {ok, init()};
 handle_command({sleep, Time}, State) ->
   timer:sleep(Time),
   {ok, State};
@@ -50,5 +56,6 @@ handle_command({register, Key, Pid}, State) ->
   State :: term(),
   Reply :: term().
 handle_query({get, Key}, State) ->
-  maps:get(Key, State, 0).
+  %io:format(user, "[~p] get ~p State: ~p~n", [self(), Key, State]),
+  maps:get(Key, State, no_value).
 

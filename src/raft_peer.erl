@@ -11,7 +11,7 @@
 -include("raft.hrl").
 
 -record(raft_peer, {
-  server :: pid(),
+  peer :: pid(),
   next_index = 1 :: log_index(),
   match_index = 0 :: log_index() | 0
 }).
@@ -25,7 +25,7 @@
 
 -spec new(pid(), raft_log:log_ref()) -> peer().
 new(Server, Log) when is_pid(Server) ->
-  #raft_peer{server = Server,
+  #raft_peer{peer = Server,
              next_index = raft_log:last_index(Log),
              match_index = 0}.
 
@@ -38,7 +38,7 @@ next_index(Peer, NextIndex) ->
   Peer#raft_peer{next_index = NextIndex}.
 
 -spec server(peer()) -> pid().
-server(#raft_peer{server = Server}) ->
+server(#raft_peer{peer = Server}) ->
   Server.
 
 -spec replicated(peer(), log_index()) -> peer().

@@ -35,7 +35,7 @@ initial_state() ->
 command(#state{log_ref = LogRef}) ->
     frequency([
         {10, {call, raft_log, append, [LogRef, req_id(), command(), raft_term()]}},
-        {5, {call, raft_log, store_snapshot, [LogRef, index(), raft_term(), user_state()]}},
+        {5, {call, raft_log, store_snapshot, [LogRef, index(), user_state()]}},
         {4, {call, raft_log, delete, [LogRef, index()]}},
         {6, {call, raft_log, is_logged, [LogRef, req_id()]}},
         {4, {call, raft_log, get_term, [LogRef, index(), raft_term()]}},
