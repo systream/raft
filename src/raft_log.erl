@@ -174,29 +174,47 @@ store_snapshot(#log_ref{data_ref = DataRef, callback = Cb,
   end.
 
 -spec store_snapshot(log_ref(), log_index(), term()) ->
-  log_ref().
+  {ok, log_ref()} | {error, index_not_found}.
 store_snapshot(#log_ref{last_snapshot_index = LastSnapshotIndex} = Ref, Index, _UserState)
   when LastSnapshotIndex >= Index andalso LastSnapshotIndex =/= undefined ->
-  Ref;
+  {ok, Ref};
 store_snapshot(Ref, Index, UserState) ->
-  {ok, LastSnapshotTerm} = get_term(Ref, Index),
-  store_snapshot(Ref, Index, LastSnapshotTerm, bloom_at_index(Ref, Index), UserState).
+  case get_term(Ref, Index) of
+    {ok, LastSnapshotTerm} ->
+      {ok, store_snapshot(Ref, Index, LastSnapshotTerm, bloom_at_index(Ref, Index), UserState)};
+    no_term ->
+      {error, index_not_found}
+  end.
+
 
 -spec bloom_at_index(log_ref(), log_index()) -> binary().
 bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = Index}, Index) ->
   ebloom:serialize(BloomRef);
 bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = LastIndex} = Ref, Index) ->
-  % Copy current bloom
-  {ok, CloneBloom} = ebloom:deserialize(ebloom:serialize(BloomRef)),
-  % build a bloom with the difference
   {ok, DiffBloomRef} = ebloom:new(LastIndex-Index, 0.0001, rand:uniform(1000)),
-  lists:foreach(fun(DIndex) ->
-                  {ok, {_Term, ReqId, _Command}} = get(Ref, DIndex),
-                  ebloom:insert(DiffBloomRef, ReqId)
-                end, lists:seq(Index, LastIndex)),
-  ebloom:difference(CloneBloom, DiffBloomRef),
-  ebloom:serialize(CloneBloom).
+  calculate_diff(DiffBloomRef, clone_bloom(BloomRef), Ref, Index, LastIndex).
 
+calculate_diff(DiffBloomRef, BaseBloom, Ref, Index, LastIndex) ->
+  ebloom:difference(BaseBloom, calculate_diff(Ref, DiffBloomRef, Index, LastIndex)),
+  ebloom:serialize(BaseBloom).
+
+calculate_diff(Ref, DiffBloom, Index, ToIndex) when ToIndex =< Index ->
+  case get(Ref, Index) of
+    {ok, {_Term, ReqId, _Command}} ->
+      ebloom:insert(DiffBloom, ReqId),
+      calculate_diff(Ref, DiffBloom, Index+1, ToIndex);
+    {snapshot, _} ->
+      calculate_diff(Ref, DiffBloom, Index+1, ToIndex)
+  end;
+calculate_diff(_Ref, DiffBloom, _Index, _ToIndex) ->
+  DiffBloom.
+
+-spec clone_bloom(reference() | binary()) -> reference().
+clone_bloom(BloomBin) when is_binary(BloomBin) ->
+  {ok, CloneBloom} = ebloom:deserialize(BloomBin),
+  CloneBloom;
+clone_bloom(Bloom) ->
+  clone_bloom(ebloom:serialize(Bloom)).
 
 -spec get_term(log_ref(), log_index() | 0, term()) -> raft_term().
 get_term(LogRef, Index, DefaultTerm) ->

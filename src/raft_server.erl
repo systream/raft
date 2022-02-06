@@ -319,6 +319,8 @@ handle_event(info, #vote_req_reply{term = Term, voter = Voter}, candidate,
   {keep_state, State};
 handle_event(state_timeout, election_timeout, candidate, State) ->
   logger:notice("Election timeout", []),
+  % @TODO if election not success for the Xth time, because of not enough participants, should
+  % slow down, increase election timeout somehow.
   {repeat_state, State};
 
 %% %%%%%%%%%%%%%%%%%
@@ -1086,13 +1088,12 @@ commit_index(Server, State, Index, From) ->
 maybe_store_snapshot(#state{log = Log, last_applied = LastApplied} = State) ->
   %@TODO better log compaction trigger logic
   SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, 100000),
-  NewLog = case LastApplied rem SnapshotChunkSize of
-              0 when LastApplied > 1 ->
-                raft_log:store_snapshot(Log, LastApplied, State#state.user_state);
-                %Log;
-              _ ->
-                Log
-            end,
+  {ok, NewLog} = case LastApplied rem SnapshotChunkSize of
+                    0 when LastApplied > 1 ->
+                      raft_log:store_snapshot(Log, LastApplied, State#state.user_state);
+                    _ ->
+                      {ok, Log}
+                  end,
   State#state{log = NewLog}.
 
 store_entries(#append_entries_req{term = Term,

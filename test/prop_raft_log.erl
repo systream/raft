@@ -39,24 +39,13 @@ initial_state() ->
 command(#state{log_ref = LogRef}) ->
   Commands = [
       {10, {call, raft_log, append, [LogRef, req_id(), command(), raft_term()]}}
-    %, {5, {call, raft_log, store_snapshot, [LogRef, index(), user_state()]}}
+    , {5, {call, raft_log, store_snapshot, [LogRef, index(), user_state()]}}
     , {4, {call, raft_log, delete, [LogRef, index()]}}
     , {6, {call, raft_log, is_logged, [LogRef, req_id()]}}
     , {4, {call, raft_log, get_term, [LogRef, index(), raft_term()]}}
-    , {3, {call, raft_log, get, [LogRef, index()]}}
+    , {7, {call, raft_log, get, [LogRef, index()]}}
       %, {2, {call, raft_log, list, [LogRef, index(), pos_integer()]}}
   ],
-
-  %LastIndex = raft_log:last_index(LogRef),
-
-  %NewCommands =
-  %  case LastIndex >= 1 of
-  %    true ->
-  %      [{5, {call, raft_log, store_snapshot, [LogRef,?SUCHTHAT(Idx, index(), begin Idx =<LastIndex end), user_state()]}} |
-  %       Commands];
-  %    _ ->
-  %      Commands
-  %  end,
   frequency(Commands).
 
 
@@ -79,9 +68,14 @@ postcondition(#state{log_ref = LogRefState},
   raft_log:is_logged(NewLogRef, ReqId) =:= true andalso
   raft_log:next_index(NewLogRef) =:= LastIndex+1;
 postcondition(_State,
+              {call, raft_log, store_snapshot, [_LogRef, _Index, _UserState]},
+              {error, index_not_found}) ->
+  true;
+postcondition(_State,
               {call, raft_log, store_snapshot, [_LogRef, Index, UserState]},
-              NewLogRef) ->
-  {snapshot, {LastIncludedTerm, LastIncludedIndex, SnUserState}} = raft_log:get(NewLogRef, Index),
+              {ok, NewLogRef}) ->
+  {snapshot, {LastIncludedTerm, LastIncludedIndex, _Bloom, SnUserState}} =
+    raft_log:get(NewLogRef, Index),
   {ok, GTTerm} = raft_log:get_term(NewLogRef, Index),
   %LastIncludedTerm =:= RaftTerm andalso
   GTTerm =:= LastIncludedTerm andalso
@@ -101,6 +95,7 @@ postcondition(#state{req_ids = ReqIds},
 postcondition(#state{req_ids = _ReqIds},
               {call, raft_log, is_logged, [_LogRef, _ReqId]},
               false) ->
+  %not lists:member(_ReqId, _ReqIds);
   % with bloom false positives may happen
   true;
 postcondition(#state{}, {call, raft_log, get_term, [_LogRef, _Index, _Def]}, _Result) ->
@@ -119,7 +114,7 @@ postcondition(#state{}, {call, raft_log, list, [_LogRef, _Index, _MaxChunk]},
 next_state(#state{req_ids = ReqIds} = State, NewLogRef,
            {call, raft_log, append, [_, ReqId, _Cmd, _Term]}) ->
   State#state{log_ref = NewLogRef, req_ids = [ReqId | ReqIds]};
-next_state(State, NewLogRef, {call, raft_log, store_snapshot, _}) ->
+next_state(State, {ok, NewLogRef}, {call, raft_log, store_snapshot, _}) ->
   State#state{log_ref = NewLogRef};
 next_state(State, NewLogRef, {call, raft_log, delete, _}) ->
   State#state{log_ref = NewLogRef};

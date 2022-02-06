@@ -1,4 +1,4 @@
-# Raft protocol
+# Raft
 
 Implementation of [replicated state machine (raft)](https://raft.github.io/) protocol.
 
