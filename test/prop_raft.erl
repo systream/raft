@@ -56,9 +56,9 @@ command(_State) ->
   On = oneof(get(raft_s)),
   frequency([
     {10, {call, raft, command, [On, {store, store_key(), pos_integer()}]}},
-    {5, {call, raft, query, [On, {get, store_key()}]}}%,
-    %{3, {call, ?MODULE, join_member, [On, new_member()]}}
-   % {3, {call, raft, leave, [On, oneof(State#test_state.collaborators)]}},
+    {5, {call, raft, query, [On, {get, store_key()}]}},
+    {3, {call, ?MODULE, join_member, [On, new_member()]}}%,
+    %{3, {call, raft, leave, [On, oneof(State#test_state.collaborators)]}}
    % {1, {call, ?MODULE, kill_collaborator, [oneof(State#test_state.collaborators)]}},
     %{1, {call, ?MODULE, stop_collaborator, [On, ?SUCHTHAT(S, oneof(get(raft_s)), S =/= On)]}}
  ]).

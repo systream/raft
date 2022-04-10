@@ -111,6 +111,8 @@ groups() ->
       , kill_the_leader_under_load
       , with_tx_id_retry
       , with_server_id
+      , force_leave
+      , force_leave_not_leader
     ]}
   ].
 
@@ -360,6 +362,39 @@ with_server_id(_Config) ->
   {ok, Pid} = raft:start(<<"id">>, raft_test_cb),
   stop([Pid]).
 
+force_leave(_Config) ->
+  [A, B, C] = Servers = form_cluster(3),
+
+  {ok, 1} = raft:command(A, {increment, 1, 1}),
+  {ok, 2} = raft:command(B, {increment, 1, 1}),
+  {ok, 3} = raft:command(C, {increment, 1, 1}),
+
+  exit(B, exit),
+  exit(C, exit),
+
+  ok = raft:force_leave(A, B),
+  ok = raft:force_leave(A, C),
+
+  {ok, 4} = raft:command(A, {increment, 1, 1}),
+  stop(Servers).
+
+force_leave_not_leader(_Config) ->
+  [A, B, C] = Servers = form_cluster(3),
+
+  {ok, 1} = raft:command(A, {increment, 1, 1}),
+  {ok, 2} = raft:command(B, {increment, 1, 1}),
+  {ok, 3} = raft:command(C, {increment, 1, 1}),
+
+  exit(A, exit),
+  exit(C, exit),
+
+  _ = raft:force_leave(B, A),
+  _ = raft:force_leave(B, C),
+
+  {ok, 4} = raft:command(B, {increment, 1, 1}),
+
+  stop(Servers).
+
 wait_until_leader(Pid) when is_pid(Pid) ->
   wait_until_leader([Pid]);
 wait_until_leader(Pids) ->
@@ -404,7 +439,7 @@ retry_until({M, F, A} = MFA, Times) ->
     {error, leader_changed} when Times > 0 ->
       timer:sleep(100),
       retry_until(MFA, Times-1);
-    {error, already_member} when  M =:= raft andalso F =:= join ->
+    {error, already_member} when M =:= raft andalso F =:= join ->
       ok;
     Else ->
       Else
@@ -471,11 +506,11 @@ last_log_index(Server) ->
 
 determine_leader([Server | RemServers]) ->
   case raft:status(Server) of
-    #{leader := undefined} ->
-      timer:sleep(10),
-      determine_leader(RemServers);
     #{leader := Leader} ->
-      Leader
+      Leader;
+    _ ->
+      timer:sleep(50),
+      determine_leader(RemServers ++ [Server])
   end.
 
 wait_to_catch_up_follower(Servers) ->
@@ -516,6 +551,10 @@ form_cluster(MemberCount) ->
   [ok = wait_until_leader(Pid) || Pid <- Servers],
   [Leader | Slaves] = Servers,
   [ok = retry_until({raft, join, [Leader, Server]}) || Server <- Slaves],
+  timer:sleep(100),
+  #{cluster_members := ClusterMembers} = raft:status(hd(Servers)),
+  [#{cluster_members := ClusterMembers} = raft:status(Server) || Server <- Slaves],
+  [true = lists:member(S, ClusterMembers) || S <- Servers],
   Servers.
 
 stop(Servers) ->

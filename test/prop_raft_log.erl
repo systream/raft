@@ -5,7 +5,7 @@
 
 %% Model Callbacks
 -export([command/1, initial_state/0, next_state/3,
-         precondition/2, postcondition/3]).
+         precondition/2, postcondition/3, get_log_ref/1]).
 
 -record(state, {
   log_ref :: raft_log:log_ref(),
@@ -113,13 +113,21 @@ postcondition(#state{}, {call, raft_log, list, [_LogRef, _Index, _MaxChunk]},
 %% accordingly for the test to proceed.
 next_state(#state{req_ids = ReqIds} = State, NewLogRef,
            {call, raft_log, append, [_, ReqId, _Cmd, _Term]}) ->
-  State#state{log_ref = NewLogRef, req_ids = [ReqId | ReqIds]};
+  State#state{log_ref = get_log_ref(NewLogRef), req_ids = [ReqId | ReqIds]};
 next_state(State, {ok, NewLogRef}, {call, raft_log, store_snapshot, _}) ->
-  State#state{log_ref = NewLogRef};
+  State#state{log_ref = get_log_ref(NewLogRef)};
 next_state(State, NewLogRef, {call, raft_log, delete, _}) ->
-  State#state{log_ref = NewLogRef};
+  State#state{log_ref = get_log_ref(NewLogRef)};
 next_state(State, _Result, {call, _Module, _Fun, _Args}) ->
   State.
+
+get_log_ref({var, _} = N) ->
+  {call, ?MODULE, ?FUNCTION_NAME, [N]};
+get_log_ref({ok, Ref}) ->
+  Ref;
+get_log_ref(Ref) ->
+  Ref.
+
 
 req_id() ->
   ?LET(S, integer(), begin <<"req_id", (erlang:integer_to_binary(S))/binary>> end).

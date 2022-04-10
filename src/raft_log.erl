@@ -11,7 +11,8 @@
 -define(INITIAL_TERM, 0).
 -define(INITIAL_INDEX, 0).
 
--define(BLOOM_CHUNK_SIZE, 10000).
+-define(BLOOM_CHUNK_SIZE, 100000).
+-define(BLOOM_MAX_SIZE, 10000000).
 
 -export([new/0, new/2,
          append/4, append_commands/3,
@@ -81,7 +82,8 @@ new(ServerId, Callback) ->
   #log_ref{data_ref = Ref,
            last_index = LastIndex,
            last_term = LastTerm,
-           callback = Callback, bloom_ref = new_bloom(1)}.
+           callback = Callback,
+           bloom_ref = new_bloom(1)}.
 
 -spec is_logged(log_ref(), req_id()) -> boolean().
 is_logged(#log_ref{bloom_ref = BloomRef} = Ref, ReqId) ->
@@ -100,12 +102,18 @@ is_req_logged(Ref, Index, ReqId) ->
       true;
     {ok, #log_entry{}} ->
       is_req_logged(Ref, Index-1, ReqId);
-    {ok, #snapshot_entry{bloom = Bloom}} ->
-      {ok, BloomRef} = ebloom:deserialize(Bloom),
-      %% @TODO deal with this
+    {ok, #snapshot_entry{bloom = _Bloom}} ->
+      %{ok, BloomRef} = ebloom:deserialize(Bloom),
+      %%% @TODO deal with this
+      %case ebloom:contains(BloomRef, ReqId) of
+      %  false ->
+      %    false;
+      %  true ->
+      %    logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
+      %    false
+      %end;
       logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
-      ebloom:contains(BloomRef, ReqId);
-      %false;
+      false;
     not_found ->
       false
   end.
@@ -191,7 +199,7 @@ store_snapshot(Ref, Index, UserState) ->
 bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = Index}, Index) ->
   ebloom:serialize(BloomRef);
 bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = LastIndex} = Ref, Index) ->
-  {ok, DiffBloomRef} = ebloom:new(LastIndex-Index, 0.0001, rand:uniform(1000)),
+  {ok, DiffBloomRef} = ebloom:new(LastIndex-Index, 0.001, rand:uniform(1000)),
   calculate_diff(DiffBloomRef, clone_bloom(BloomRef), Ref, Index, LastIndex).
 
 calculate_diff(DiffBloomRef, BaseBloom, Ref, Index, LastIndex) ->
@@ -308,8 +316,11 @@ destroy(#log_ref{data_ref = Ref, callback = Callback}) ->
   apply(Callback, destroy, [Ref]).
 
 -spec new_bloom(log_index()) -> reference().
+new_bloom(Index) when Index > ?BLOOM_MAX_SIZE ->
+  {ok, BloomRef} = ebloom:new(?BLOOM_MAX_SIZE, 0.0001, rand:uniform(?BLOOM_CHUNK_SIZE)),
+  BloomRef;
 new_bloom(Index) ->
-  BloomChunkSize = (Index div ?BLOOM_CHUNK_SIZE) + (2*?BLOOM_CHUNK_SIZE),
+  BloomChunkSize = (Index div ?BLOOM_CHUNK_SIZE) + (1*?BLOOM_CHUNK_SIZE),
   {ok, BloomRef} = ebloom:new(BloomChunkSize, 0.001, rand:uniform(?BLOOM_CHUNK_SIZE)),
   BloomRef.
 

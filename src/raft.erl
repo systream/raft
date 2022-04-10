@@ -9,7 +9,7 @@
 -author("Peter Tihanyi").
 
 -export([start/1, start/2, stop/1,
-         join/2, leave/2,
+         join/2, leave/2, force_leave/2,
          status/1,
          command/2, command/3, query/2]).
 
@@ -47,6 +47,10 @@ join(ActualClusterMember, NewClusterMember) ->
 -spec leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
 leave(ClusterMember, MemberToLeave) ->
   raft_server:leave(ClusterMember, MemberToLeave).
+
+-spec force_leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
+force_leave(ClusterMember, MemberToLeave) ->
+  raft_server:force_leave(ClusterMember, MemberToLeave).
 
 -spec status(pid()) -> map().
 status(ClusterMember) ->

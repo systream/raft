@@ -29,7 +29,8 @@
 -export([start_link/2, stop/1,
          status/1,
          command/2, query/2,
-         join/2, leave/2, command/3]).
+         join/2, leave/2, force_leave/2,
+         command/3]).
 
 %% gen_statem callbacks
 -export([init/1,
@@ -161,6 +162,10 @@ join(ClusterMember, NewClusterMember) ->
 leave(ClusterMember, MemberToLeave) ->
   call(ClusterMember, {leave, MemberToLeave}, {clean_timeout, 5000}).
 
+-spec force_leave(pid(), pid()) -> ok | {error, no_leader | leader_changed}.
+force_leave(ClusterMember, MemberToLeave) ->
+  call(ClusterMember, {force_leave, MemberToLeave}, {clean_timeout, 5000}).
+
 -spec command(pid(), term()) ->
   term().
 command(ActualClusterMember, Command) ->
@@ -182,11 +187,16 @@ call(Server, Command, Timeout) ->
     {error, {not_leader, undefined}} ->
       %erase({?MODULE, leader, Server}),
       {error, no_leader};
+    {error, leader_changed} ->
+      %erase({?MODULE, leader, Server}),
+      timer:sleep(5),
+      call(Server, Command, Timeout);
     {error, {not_leader, Pid}} ->
       %put({?MODULE, leader, Server}, Pid),
       case call(Pid, Command, Timeout) of
         {'EXIT', {noproc, _}} ->
           % leader somehow died
+          % retry with the original server, it may know who is the new leader
           % retry with the original server, it may know who is the new leader
           call(Server, Command, Timeout);
         Else ->
@@ -204,14 +214,18 @@ call(Server, Command, Timeout) ->
 init({ServerId, CallbackModule}) ->
   erlang:process_flag(trap_exit, true),
   logger:info("Starting raft server with id: ~p, callback: ~p", [ServerId, CallbackModule]),
-  Log = try
-          raft_log:new(ServerId, apply(CallbackModule, get_log_module, []))
-        catch error:undef:_S ->
-          raft_log:new(ServerId, raft_log_ets)
-        end,
+  Log = init_log(ServerId, CallbackModule),
   {ok, follower, init_user_state(#state{callback = CallbackModule,
                                         log = Log,
                                         cluster = raft_cluster:new()})}.
+
+-spec init_log(binary(), module()) -> raft_log:log_ref().
+init_log(ServerId, CallbackModule) ->
+  try
+    raft_log:new(ServerId, apply(CallbackModule, get_log_module, []))
+  catch error:undef:_StackTrace ->
+    raft_log:new(ServerId, raft_log_ets)
+  end.
 
 -spec callback_mode() -> [handle_event_function | state_enter].
 callback_mode() ->
@@ -252,7 +266,7 @@ handle_event(enter, PrevStateName, follower, #state{cluster = Cluster} = State) 
   case raft_cluster:majority_count(Cluster) of
     1 ->
       % Alone in cluster, no one will send heartbeat, so step up for candidate (almost) immediately
-      {keep_state, State#state{inner_state = #follower_state{}}, [?ELECTION_TIMEOUT(10)]};
+      {keep_state, State#state{inner_state = #follower_state{}}, [?ELECTION_TIMEOUT(3)]};
     _ ->
       {keep_state, State#state{inner_state = #follower_state{}}, [?ELECTION_TIMEOUT]}
   end;
@@ -272,8 +286,8 @@ handle_event(enter, _PrevStateName, candidate,
   % To begin an election, a follower increments its current term and transitions to candidate state
   NewTerm = Term+1,
   logger:info("Became a candidate with term ~p", [NewTerm]),
-  Me = self(),
 
+  Me = self(),
   VoteReq = #vote_req{
     term = NewTerm,
     candidate = Me,
@@ -283,7 +297,7 @@ handle_event(enter, _PrevStateName, candidate,
 
   % It then votes for itself and issues RequestVote RPCs in parallel to each of
   % the other servers in the cluster
-  send_msg(Me, #vote_req_reply{term = NewTerm, voter = self(), granted = true}),
+  send_msg(Me, #vote_req_reply{term = NewTerm, voter = Me, granted = true}),
   logger:debug("Send vote request for term ~p", [NewTerm]),
 
   [send_msg(Server, VoteReq) || Server <- raft_cluster:members(Cluster), Server =/= Me],
@@ -609,6 +623,22 @@ handle_event({call, From}, {leave, Server}, leader,
       gen_statem:reply(From, Error),
       keep_state_and_data
   end;
+handle_event({call, From}, {force_leave, Server}, _StateName,
+             #state{cluster = Cluster} = State) ->
+  logger:info("Force leace request for ~p ", [Server]),
+  Leader = raft_cluster:leader(Cluster),
+  case Leader of
+    undefined ->
+      handle_event({call, From}, {leave, Server}, leader, State);
+    _ ->
+      case rpc:call(node(Leader), erlang, is_process_alive, [Leader]) of
+        true when Leader =/= self() ->
+          gen_statem:reply(From, {error, {not_leader, Leader}}),
+          keep_state_and_data;
+        _ ->
+          handle_event({call, From}, {leave, Server}, leader, State)
+      end
+  end;
 handle_event(info, #append_entries_resp{term = Term}, _StateName,
         #state{current_term = CurrentTerm, cluster = Cluster} = State)
   when CurrentTerm < Term ->
@@ -910,11 +940,11 @@ handle_append_entries_resp(#append_entries_resp{success = false,
                                   cluster = Cluster,
                                   committed_index = CommittedIndex
                           } = State) ->
-  logger:notice("Got negative appen_entries_resp from ~p with ~p match_index",
-                [Server, MatchIndex]),
+  logger:notice("Got negative append_entries_resp from ~p with ~p match_index: ~p",
+                [Server, MatchIndex, Peers]),
   case maps:get(Server, Peers, not_found) of
     not_found ->
-      logger:notice("Got negative appen_entries_resp from unknown server ~p -> ~p",
+      logger:warning("Got negative append_entries_resp from unknown server ~p -> ~p",
                     [Server, Peers]),
       State;
     Peer ->
@@ -1081,13 +1111,14 @@ commit_index(Server, State, Index, From) ->
       NewState5 = replicated(Server, Index, NewState4),
       handle_command(From, generate_req_id(), {?CLUSTER_CHANGE, FinalCluster}, NewState5);
     _ ->
+      logger:debug("Send reply to ~p to ~p idx: ~p", [From, Reply, Index]),
       gen_statem:reply(From, Reply),
       replicated(Server, Index, NewState4)
   end.
 
 maybe_store_snapshot(#state{log = Log, last_applied = LastApplied} = State) ->
   %@TODO better log compaction trigger logic
-  SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, 100000),
+  SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, 1000),
   {ok, NewLog} = case LastApplied rem SnapshotChunkSize of
                     0 when LastApplied > 1 ->
                       raft_log:store_snapshot(Log, LastApplied, State#state.user_state);

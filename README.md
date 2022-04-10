@@ -7,7 +7,7 @@ Implemented:
 * Log replication
 * Cluster changes
 * Log compaction (snapshotting)
-* Request repetition filtering (bloom filter)
+* Request repetition filtering optimization (bloom filtering)
 
 ## Usage
 
@@ -92,7 +92,7 @@ This parameters configures the max amount of commands send in one message. defau
 ### Automatic snapshot chunks size
 
 `snapshot_chunk_size` After a certain amount of commands 
-every raft server does log compactions (create a snapshot). default: 100000   
+every raft server does log compactions (create a snapshot). default: 100000
 
 Build
 -----
