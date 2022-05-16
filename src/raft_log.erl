@@ -11,10 +11,8 @@
 -define(INITIAL_TERM, 0).
 -define(INITIAL_INDEX, 0).
 
--define(BLOOM_CHUNK_SIZE, 10000).
-
 -export([new/0, new/2,
-         append/4, append_commands/3,
+         append/3, append_commands/3,
          destroy/1,
          last_index/1, last_term/1,
          get_term/3, get_term/2,
@@ -22,11 +20,9 @@
          delete/2,
          list/3,
          next_index/1,
-         store_snapshot/3, store_snapshot/5,
-         is_logged/2]).
+         store_snapshot/3, store_snapshot/4]).
 
 -record(log_ref, {data_ref :: term(),
-                  bloom_ref :: reference(),
                   callback :: module(),
                   last_index = ?INITIAL_INDEX :: log_index() | 0,
                   last_term = ?INITIAL_TERM :: raft_term(),
@@ -39,7 +35,6 @@
 -record(log_entry, {
   log_index :: log_index(),
   term :: raft_term(),
-  req_id :: binary(),
   command :: command()
 }).
 
@@ -48,7 +43,6 @@
 -record(snapshot_entry, {
   last_included_index :: log_index(),
   last_included_term :: raft_term(),
-  bloom :: binary(),
   state :: term()
 }).
 
@@ -81,34 +75,7 @@ new(ServerId, Callback) ->
   #log_ref{data_ref = Ref,
            last_index = LastIndex,
            last_term = LastTerm,
-           callback = Callback, bloom_ref = new_bloom(1)}.
-
--spec is_logged(log_ref(), req_id()) -> boolean().
-is_logged(#log_ref{bloom_ref = BloomRef} = Ref, ReqId) ->
-  case ebloom:contains(BloomRef, ReqId) of
-    true ->
-      logger:debug("Need to lookup logged ref in log index: ~p", [ReqId]),
-      is_req_logged(Ref, Ref#log_ref.last_index, ReqId);
-    false ->
-      false
-  end.
-
--spec is_req_logged(log_ref(), log_index(), req_id()) -> boolean().
-is_req_logged(Ref, Index, ReqId) ->
-  case get_by_callback(Ref, Index) of
-    {ok, #log_entry{req_id = ReqId}} ->
-      true;
-    {ok, #log_entry{}} ->
-      is_req_logged(Ref, Index-1, ReqId);
-    {ok, #snapshot_entry{bloom = Bloom}} ->
-      {ok, BloomRef} = ebloom:deserialize(Bloom),
-      %% @TODO deal with this
-      logger:notice("Really could not tell is req_id processed or not: ~p", [ReqId]),
-      ebloom:contains(BloomRef, ReqId);
-      %false;
-    not_found ->
-      false
-  end.
+           callback = Callback}.
 
 -spec last_index(log_ref()) -> log_index() | 0.
 last_index(#log_ref{last_index = Pos}) ->
@@ -118,41 +85,38 @@ last_index(#log_ref{last_index = Pos}) ->
 last_term(#log_ref{last_term = Term}) ->
   Term.
 
--spec append(log_ref(), binary(), command(), raft_term()) -> log_ref().
+-spec append(log_ref(), command(), raft_term()) -> log_ref().
 append(#log_ref{data_ref = Ref, last_term = LastTerm,
-                callback = Cb, bloom_ref = BloomRef} = LogRef, ReqId, Command, Term) ->
+                callback = Cb} = LogRef, Command, Term) ->
   NewPos = next_index(LogRef),
   logger:debug("Storing log entry on index ~p with term ~p command ~p", [NewPos, Term, Command]),
-  LogEntry = #log_entry{log_index = NewPos, req_id = ReqId, term = Term, command = Command},
+  LogEntry = #log_entry{log_index = NewPos, term = Term, command = Command},
   NewRef = apply(Cb, store, [Ref, NewPos, LogEntry]),
-  ok = ebloom:insert(BloomRef, ReqId),
   LogRef#log_ref{last_index = NewPos,
                  last_term = Term,
-                 bloom_ref = maybe_upgrade_bloom(NewPos, BloomRef),
                  penultimate_term = LastTerm,
                  data_ref = NewRef}.
 
--spec append_commands(log_ref(), [{raft_term(), req_id(), command()}], log_index()) -> log_ref().
+-spec append_commands(log_ref(), [{raft_term(), command()}], log_index()) -> log_ref().
 append_commands(LogRef, [], _NextIndex) ->
   LogRef;
 append_commands(#log_ref{last_index = LastIndex} = Log,
-                [{Term, ReqId, Command} | RestCommands], Index) ->
+                [{Term, Command} | RestCommands], Index) ->
   case LastIndex >= Index of
     true ->
       append_commands(Log, RestCommands, Index+1);
     false ->
-      append_commands(append(Log, ReqId, Command, Term), RestCommands, Index+1)
+      append_commands(append(Log, Command, Term), RestCommands, Index+1)
   end.
 
--spec store_snapshot(log_ref(), log_index(), raft_term(), binary(), term()) ->
+-spec store_snapshot(log_ref(), log_index(), raft_term(), term()) ->
   log_ref().
 store_snapshot(#log_ref{data_ref = DataRef, callback = Cb,
                         last_snapshot_index = LastSnapshotIndex} = Ref,
-               Index, LastSnapshotTerm, Bloom, UserState) ->
+               Index, LastSnapshotTerm, UserState) ->
   Snapshot = #snapshot_entry{
     last_included_index = Index,
     last_included_term = LastSnapshotTerm,
-    bloom = Bloom,
     state = UserState
   },
   logger:info("Storing snapshot for index ~p", [Index]),
@@ -161,10 +125,8 @@ store_snapshot(#log_ref{data_ref = DataRef, callback = Cb,
   NewRef = maybe_cleanup(Ref#log_ref{data_ref = NewDataRef}, LastSnapshotIndex, Index),
   case NewRef#log_ref.last_index =< Index of
     true ->
-      {ok, BloomRef} = ebloom:deserialize(Bloom),
       NewRef#log_ref{last_snapshot_index = Index,
                      last_index = Index, last_term = LastSnapshotTerm,
-                     bloom_ref = BloomRef,
                      penultimate_term = undefined};
     _ when LastSnapshotIndex =< Index orelse LastSnapshotIndex =:= undefined ->
       NewRef#log_ref{last_snapshot_index = Index,
@@ -181,40 +143,10 @@ store_snapshot(#log_ref{last_snapshot_index = LastSnapshotIndex} = Ref, Index, _
 store_snapshot(Ref, Index, UserState) ->
   case get_term(Ref, Index) of
     {ok, LastSnapshotTerm} ->
-      {ok, store_snapshot(Ref, Index, LastSnapshotTerm, bloom_at_index(Ref, Index), UserState)};
+      {ok, store_snapshot(Ref, Index, LastSnapshotTerm, UserState)};
     no_term ->
       {error, index_not_found}
   end.
-
-
--spec bloom_at_index(log_ref(), log_index()) -> binary().
-bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = Index}, Index) ->
-  ebloom:serialize(BloomRef);
-bloom_at_index(#log_ref{bloom_ref = BloomRef, last_index = LastIndex} = Ref, Index) ->
-  {ok, DiffBloomRef} = ebloom:new(LastIndex-Index, 0.0001, rand:uniform(1000)),
-  calculate_diff(DiffBloomRef, clone_bloom(BloomRef), Ref, Index, LastIndex).
-
-calculate_diff(DiffBloomRef, BaseBloom, Ref, Index, LastIndex) ->
-  ebloom:difference(BaseBloom, calculate_diff(Ref, DiffBloomRef, Index, LastIndex)),
-  ebloom:serialize(BaseBloom).
-
-calculate_diff(Ref, DiffBloom, Index, ToIndex) when ToIndex =< Index ->
-  case get(Ref, Index) of
-    {ok, {_Term, ReqId, _Command}} ->
-      ebloom:insert(DiffBloom, ReqId),
-      calculate_diff(Ref, DiffBloom, Index+1, ToIndex);
-    {snapshot, _} ->
-      calculate_diff(Ref, DiffBloom, Index+1, ToIndex)
-  end;
-calculate_diff(_Ref, DiffBloom, _Index, _ToIndex) ->
-  DiffBloom.
-
--spec clone_bloom(reference() | binary()) -> reference().
-clone_bloom(BloomBin) when is_binary(BloomBin) ->
-  {ok, CloneBloom} = ebloom:deserialize(BloomBin),
-  CloneBloom;
-clone_bloom(Bloom) ->
-  clone_bloom(ebloom:serialize(Bloom)).
 
 -spec get_term(log_ref(), log_index() | 0, term()) -> raft_term().
 get_term(LogRef, Index, DefaultTerm) ->
@@ -244,17 +176,16 @@ get_term(Log, Index) ->
   end.
 
 -spec get(log_ref(), log_index()) ->
-  {ok, {raft_term(), req_id(), command()}} |
-  {snapshot, {raft_term(), log_index(), binary(), term()}} | not_found.
+  {ok, {raft_term(), command()}} |
+  {snapshot, {raft_term(), log_index(), term()}} | not_found.
 get(Ref, Index) ->
   case get_by_callback(Ref, Index) of
-    {ok, #log_entry{term = Term, req_id = ReqId, command = Command}} ->
-      {ok, {Term, ReqId, Command}};
+    {ok, #log_entry{term = Term, command = Command}} ->
+      {ok, {Term, Command}};
     {ok, #snapshot_entry{last_included_index = LastIncludedIndex,
                          last_included_term = LastIncludedTerm,
-                         bloom = Bloom,
                          state = UserState}} ->
-      {snapshot, {LastIncludedTerm, LastIncludedIndex, Bloom, UserState}};
+      {snapshot, {LastIncludedTerm, LastIncludedIndex, UserState}};
     not_found ->
       not_found
   end.
@@ -264,8 +195,8 @@ get_by_callback(#log_ref{callback = Callback, data_ref = Ref}, Index) ->
   apply(Callback, lookup, [Ref, Index]).
 
 -spec list(log_ref(), log_index(), pos_integer()) ->
-  {ok, log_index(), list({term(), req_id(), command()})} |
-  {snapshot, {raft_term(), log_index(), binary(), term()}}.
+  {ok, log_index(), list({term(), command()})} |
+  {snapshot, {raft_term(), log_index(), term()}}.
 list(#log_ref{last_snapshot_index = SnapshotIndex} = Log, FromIndex, _MaxChunk)
   when FromIndex =< SnapshotIndex andalso SnapshotIndex =/= undefined ->
   {snapshot, _} = get(Log, SnapshotIndex);
@@ -275,8 +206,8 @@ list(#log_ref{last_index = LastIndex} = Log, FromIndex, MaxChunk) when FromIndex
 list(#log_ref{last_index = LastIndex}, _FromIndex, _MaxChunk) ->
   {ok, LastIndex, []}.
 
--spec get_list(log_ref(), log_index(), log_index(), list({term(), req_id(), command()})) ->
-  list({term(), req_id(), command()}).
+-spec get_list(log_ref(), log_index(), log_index(), list({term(), command()})) ->
+  list({term(), command()}).
 get_list(Log, CurrentIndex, FromIndex, Acc) when CurrentIndex >= FromIndex ->
   {ok, Command} = get(Log, CurrentIndex),
   get_list(Log, CurrentIndex-1, FromIndex, [Command | Acc]);
@@ -306,21 +237,6 @@ delete(#log_ref{last_index = LastIndex} = LogRef, _Index) ->
 -spec destroy(log_ref()) -> ok.
 destroy(#log_ref{data_ref = Ref, callback = Callback}) ->
   apply(Callback, destroy, [Ref]).
-
--spec new_bloom(log_index()) -> reference().
-new_bloom(Index) ->
-  BloomChunkSize = (Index div ?BLOOM_CHUNK_SIZE) + (2*?BLOOM_CHUNK_SIZE),
-  {ok, BloomRef} = ebloom:new(BloomChunkSize, 0.001, rand:uniform(?BLOOM_CHUNK_SIZE)),
-  BloomRef.
-
--spec maybe_upgrade_bloom(log_index(), reference()) -> reference().
-maybe_upgrade_bloom(Index, BloomRef) when Index rem ?BLOOM_CHUNK_SIZE =:= 0 ->
-  NewBloom = new_bloom(Index),
-  logger:debug("Upgrading bloom filter at index ~p", [Index]),
-  ok = ebloom:union(NewBloom, BloomRef),
-  NewBloom;
-maybe_upgrade_bloom(_Index, BloomRef) ->
-  BloomRef.
 
 maybe_cleanup(Ref, undefined, Index) ->
   maybe_cleanup(Ref, 1, Index);

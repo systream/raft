@@ -7,7 +7,6 @@ Implemented:
 * Log replication
 * Cluster changes
 * Log compaction (snapshotting)
-* Request repetition filtering (bloom filter)
 
 ## Usage
 

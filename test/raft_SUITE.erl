@@ -109,7 +109,6 @@ groups() ->
       , not_able_to_server_without_majority_failure
       , parallel_joins
       , kill_the_leader_under_load
-      , with_tx_id_retry
       , with_server_id
     ]}
   ].
@@ -348,13 +347,6 @@ kill_the_leader_under_load(_Config) ->
 
   stop(Servers).
 
-with_tx_id_retry(_Config) ->
-  Servers = form_cluster(3),
-
-  {ok, _} = retry_until({raft, command, [pick_server(Servers), <<"test_txid">>, {hash, 1, 1}]}),
-  ?assertEqual({error, {req_id_already_appended_to_log, <<"test_txid">>}},
-               retry_until({raft, command, [pick_server(Servers), <<"test_txid">>, {hash, 1, 1}]})),
-  stop(Servers).
 
 with_server_id(_Config) ->
   {ok, Pid} = raft:start(<<"id">>, raft_test_cb),

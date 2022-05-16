@@ -127,17 +127,17 @@ last_entries_new_log(_Config) ->
 
 append_log(_Config) ->
   LogRef = raft_log:new(),
-  LogRef2 = raft_log:append(LogRef, <<"reqid1">>, test_command, 5),
+  LogRef2 = raft_log:append(LogRef, test_command, 5),
   ?assertEqual(1, raft_log:last_index(LogRef2)),
   ?assertEqual(5, raft_log:last_term(LogRef2)).
 
 append_log_overwrite(_Config) ->
   LogRef = raft_log:new(),
-  _LogRef2 = raft_log:append(LogRef, <<"5">>, test_command, 5),
-  LogRef3 = raft_log:append(LogRef, <<"reqid6">>, test_command2, 6),
+  _LogRef2 = raft_log:append(LogRef, test_command, 5),
+  LogRef3 = raft_log:append(LogRef, test_command2, 6),
   ?assertEqual(1, raft_log:last_index(LogRef3)),
   ?assertEqual(6, raft_log:last_term(LogRef3)),
-  ?assertEqual({ok, {6, <<"reqid6">>, test_command2}}, raft_log:get(LogRef3, 1)).
+  ?assertEqual({ok, {6, test_command2}}, raft_log:get(LogRef3, 1)).
 
 log_not_found(_Config) ->
   LogRef = raft_log:new(),
@@ -146,23 +146,23 @@ log_not_found(_Config) ->
 next_index(_Config) ->
   LogRef = raft_log:new(),
   ?assertEqual(1, raft_log:next_index(LogRef)),
-  LogRef2 = raft_log:append(LogRef, <<"1">>, test_command, 1),
+  LogRef2 = raft_log:append(LogRef, test_command, 1),
   ?assertEqual(2, raft_log:next_index(LogRef2)).
 
 delete(_Config) ->
   LogRef = raft_log:new(),
   Entries = 10,
   LogRef2 = lists:foldl(fun(I, LRef) ->
-                          raft_log:append(LRef, integer_to_binary(I), {test, I}, 1)
+                          raft_log:append(LRef, {test, I}, 1)
                         end, LogRef, lists:seq(1, Entries)),
 
   Index = 5,
-  ?assertEqual({ok, {1, integer_to_binary(Index), {test, Index}}}, raft_log:get(LogRef2, Index)),
+  ?assertEqual({ok, {1, {test, Index}}}, raft_log:get(LogRef2, Index)),
   LogRef3 = raft_log:delete(LogRef2, 5),
 
   ?assertEqual(not_found, raft_log:get(LogRef3, Index)),
   ?assertEqual(not_found, raft_log:get(LogRef3, Index+1)),
-  ?assertEqual({ok, {1, integer_to_binary(Index-1), {test, Index-1}}},
+  ?assertEqual({ok, {1, {test, Index-1}}},
                raft_log:get(LogRef3, Index-1)).
 
 delete_unknown(_Config) ->
@@ -177,30 +177,30 @@ destroy(_Config) ->
 append_commands(_Config) ->
   LogRef = raft_log:new(),
   Command = fun (I) -> {store, test, I} end,
-  NewLogRef = raft_log:append_commands(LogRef, [{1, <<"1">>, Command(1)},
-                                                {1, <<"2">>, Command(2)}], 1),
+  NewLogRef = raft_log:append_commands(LogRef, [{1, Command(1)},
+                                                {1, Command(2)}], 1),
   ?assertEqual(2, raft_log:last_index(NewLogRef)),
   ?assertEqual(1, raft_log:last_term(NewLogRef)),
 
   % do not append command when already set
-  NewLogRef2 = raft_log:append_commands(NewLogRef, [{1, <<"1">>, Command(1)},
-                                                    {1, <<"2">>, Command(2)},
-                                                    {2, <<"3">>, Command(3)}],
+  NewLogRef2 = raft_log:append_commands(NewLogRef, [{1, Command(1)},
+                                                    {1, Command(2)},
+                                                    {2, Command(3)}],
                                         1),
   ?assertEqual(3, raft_log:last_index(NewLogRef2)),
   ?assertEqual(2, raft_log:last_term(NewLogRef2)),
-  ?assertEqual({ok, 3, [{1, <<"1">>,Command(1)},
-                        {1, <<"2">>, Command(2)},
-                        {2, <<"3">>, Command(3)}]}, raft_log:list(NewLogRef2, 1, 100)),
+  ?assertEqual({ok, 3, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)}]}, raft_log:list(NewLogRef2, 1, 100)),
 
-  NewLogRef3 = raft_log:append_commands(NewLogRef2, [{2, <<"4">>, Command(4)}], 4),
+  NewLogRef3 = raft_log:append_commands(NewLogRef2, [{2, Command(4)}], 4),
 
   ?assertEqual(4, raft_log:last_index(NewLogRef3)),
   ?assertEqual(2, raft_log:last_term(NewLogRef3)),
-  ?assertEqual({ok, 4, [{1, <<"1">>, Command(1)},
-                        {1, <<"2">>, Command(2)},
-                        {2, <<"3">>, Command(3)},
-                        {2, <<"4">>, Command(4)}]}, raft_log:list(NewLogRef3, 1, 100)),
-  ?assertEqual({ok, 3, [{1, <<"1">>, Command(1)},
-                        {1, <<"2">>, Command(2)},
-                        {2, <<"3">>, Command(3)}]}, raft_log:list(NewLogRef3, 1, 2)).
+  ?assertEqual({ok, 4, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)},
+                        {2, Command(4)}]}, raft_log:list(NewLogRef3, 1, 100)),
+  ?assertEqual({ok, 3, [{1, Command(1)},
+                        {1, Command(2)},
+                        {2, Command(3)}]}, raft_log:list(NewLogRef3, 1, 2)).
