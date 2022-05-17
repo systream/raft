@@ -63,7 +63,7 @@
 
 -record(leader_state, {
   peers = #{} :: #{pid() => raft_peer:peer()},
-  active_requests = #{} :: #{log_index() => active_request()}
+  active_requests = orddict:new() :: orddict:orddict()
 }).
 
 -type(follower_state() :: #follower_state{}).
@@ -626,10 +626,10 @@ handle_event(info, {repl_timeout, Index}, leader,
                     committed_index = CommitIndex,
                     log = Log} = State) ->
 
-  case maps:get(Index, ActiveRequests, processed) of
-    processed ->
+  case orddict:find(Index, ActiveRequests) of
+    error ->
       {keep_state, State};
-    #request{replicated = Pids} = Req ->
+    {ok, #request{replicated = Pids} = Req} ->
       NotRepliedServer = maps:fold(fun (_, Peer, Acc) ->
                                     case lists:member(raft_peer:server(Peer), Pids) of
                                       true ->
@@ -656,7 +656,7 @@ handle_event(info, {repl_timeout, Index}, leader,
       [raft_peer:send(Peer, AppendEntriesReq) || Peer <- NotRepliedServer],
       NewReq = Req#request{tref = create_timer(Index, ?REPLICATION_TIMEOUT)},
       {keep_state, State#state{inner_state = LeaderState#leader_state{
-        active_requests = ActiveRequests#{Index => NewReq}
+        active_requests = orddict:store(Index, NewReq, ActiveRequests)
       }}}
   end;
 
@@ -847,7 +847,7 @@ handle_command(From, {?CLUSTER_CHANGE_COMMAND, NewCluster} = Command,
                            from = From,
                            tref = create_timer(LogIndex, ?REPLICATION_TIMEOUT),
                            majority = raft_cluster:majority_count(JointCluster)},
-  NewCurrentActiveRequests = CurrentRequests#{LogIndex => ActiveRequest},
+  NewCurrentActiveRequests = orddict:store(LogIndex, ActiveRequest, CurrentRequests),
   NewLeaderState2 = NewLeaderState#leader_state{active_requests = NewCurrentActiveRequests},
 
   SelfAppendEntriesResp = #append_entries_resp{term = Term,
@@ -875,7 +875,7 @@ handle_command(From, {?CLUSTER_CHANGE, NewCluster} = Command,
                                from = From,
                                tref = create_timer(LogIndex, ?REPLICATION_TIMEOUT),
                                majority = raft_cluster:majority_count(NewCluster)},
-      NewCurrentActiveRequests = CurrentRequests#{LogIndex => ActiveRequest},
+      NewCurrentActiveRequests = orddict:store(LogIndex, ActiveRequest, CurrentRequests),
       NewLeaderState2 = NewLeaderState#leader_state{active_requests = NewCurrentActiveRequests},
       SelfAppendEntriesResp = #append_entries_resp{term = Term,
                                                    server = self(),
@@ -906,7 +906,7 @@ handle_command(From, Command,
                            from = From,
                            tref = create_timer(LogIndex, ?REPLICATION_TIMEOUT),
                            majority = raft_cluster:majority_count(Cluster)},
-  NewCurrentActiveRequests = CurrentRequests#{LogIndex => ActiveRequest},
+  NewCurrentActiveRequests = orddict:store(LogIndex, ActiveRequest, CurrentRequests),
   NewLeaderState = LeaderState#leader_state{active_requests = NewCurrentActiveRequests},
 
   SelfAppendEntriesResp = #append_entries_resp{term = Term,
@@ -962,11 +962,11 @@ handle_append_entries_resp(#append_entries_resp{success = false,
   end.
 
 cancel_all_pending_requests(#leader_state{active_requests = ActiveRequests} = LeaderState) ->
-    maps:map(fun(_, #request{from = From, tref = Tref}) ->
+    orddict:map(fun(_, #request{from = From, tref = Tref}) ->
                 cleat_timer(Tref),
                 gen_statem:reply(From, {error, leader_changed})
               end, ActiveRequests),
-    LeaderState#leader_state{active_requests = #{}}.
+    LeaderState#leader_state{active_requests = orddict:new()}.
 
 set_logger_meta(Meta) ->
   NewMeta = case logger:get_process_metadata() of
@@ -1057,53 +1057,48 @@ replicated(Server, MatchIndex,
   end.
 
 handle_request(Server, ActiveRequests, MatchIndex) ->
-  case maps:get(MatchIndex, ActiveRequests, no_request) of
-    no_request ->
-      logger:debug("No active request found for index ~p",  [MatchIndex]),
-      ActiveRequests;
-    #request{replicated = Replicated} = ActiveRequest ->
+  case orddict:find(MatchIndex, ActiveRequests) of
+    {ok, #request{replicated = Replicated} = ActiveRequest} ->
       logger:debug("Active request found for index ~p -> ~p", [MatchIndex, ActiveRequest]),
       NewReplicated = case lists:member(Server, Replicated) of
                         true -> Replicated;
                         _ -> [Server | Replicated]
                       end,
       NewActiveRequest = ActiveRequest#request{replicated = NewReplicated},
-      NewActiveRequests = ActiveRequests#{MatchIndex => NewActiveRequest},
+      NewActiveRequests = orddict:store(MatchIndex, NewActiveRequest, ActiveRequests),
       case replicated_indexes(NewActiveRequests, MatchIndex) of
         {UpdatedNewActiveRequest, []} ->
           UpdatedNewActiveRequest;
         {UpdatedNewActiveRequest, IndexesToCommit} ->
           {replicated, UpdatedNewActiveRequest, IndexesToCommit}
-      end
+      end;
+    error ->
+      logger:debug("No active request found for index ~p",  [MatchIndex]),
+      ActiveRequests
   end.
 
 replicated_indexes(Requests, Index) ->
   replicated_indexes(Requests, Index, []).
 
 replicated_indexes(Requests, Index, Acc) ->
-  case maps:get(Index, Requests, not_found) of
-    #request{replicated = Replicated, majority = Majority}
+  case orddict:find(Index, Requests) of
+    {ok, #request{replicated = Replicated, majority = Majority}}
       when length(Replicated) >= Majority ->
       logger:debug("Majority of the logs are successfully replicated for index ~p", [Index]),
       % Clean all the lower indexes because if have majority replicated all the lower
       % requests surely replicated
       {NewRequests, NewAcc} = clean_requests(Index, Requests, Acc),
       replicated_indexes(NewRequests, Index+1, NewAcc);
-    not_found when map_size(Requests) > 0 ->
-      NextActiveRequestIndex = lists:min(maps:keys(Requests)),
-      replicated_indexes(Requests, NextActiveRequestIndex, Acc);
     _  ->
       {Requests, lists:reverse(Acc)}
   end.
 
-clean_requests(Index, Request, Acc) ->
-  case maps:get(Index, Request, not_found) of
-    not_found ->
-      {Request, Acc};
-    #request{from = From, tref = Tref} ->
-      cleat_timer(Tref),
-      clean_requests(Index-1, maps:remove(Index, Request), [{Index, From} | Acc])
-  end.
+clean_requests(Index, [{RequestIndex, #request{from = From, tref = Tref}} | Rest], Acc)
+  when RequestIndex =< Index ->
+  cleat_timer(Tref),
+  clean_requests(Index, Rest, [{Index, From} | Acc]);
+clean_requests(_Index, Requests, Acc) ->
+  {Requests, Acc}.
 
 commit_index(Server, State, Index, From) ->
   NewState2 = State#state{committed_index = Index},
