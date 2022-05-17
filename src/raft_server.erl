@@ -985,7 +985,7 @@ send_append_req(Peer, Log, Term, CommittedIndex, Cluster) ->
   Server = raft_peer:server(Peer),
   PrevIndex = NextIndex-1,
 
-  MaxChunk = application:get_env(raft, max_append_entries_chunk_size, 1),
+  MaxChunk = application:get_env(raft, max_append_entries_chunk_size, 100),
   case raft_log:list(Log, NextIndex, MaxChunk) of
     {ok, EndIndex, Entries} ->
       PrevLogTerm = raft_log:get_term(Log, PrevIndex, Term),
