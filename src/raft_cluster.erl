@@ -44,6 +44,8 @@ leader(#raft_cluster{leader = Leader}) ->
 -spec leader(cluster(), pid() | undefined) -> cluster().
 leader(Cluster, undefined) ->
   increase_term(Cluster#raft_cluster{leader = undefined});
+leader(#raft_cluster{leader = Leader} = Cluster, Leader) ->
+  Cluster;
 leader(Cluster, Leader) ->
   case is_member(Leader, Cluster) of
     true ->

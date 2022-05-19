@@ -7,6 +7,7 @@
 -module(raft_log).
 
 -include("raft.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -define(INITIAL_TERM, 0).
 -define(INITIAL_INDEX, 0).
@@ -89,7 +90,7 @@ last_term(#log_ref{last_term = Term}) ->
 append(#log_ref{data_ref = Ref, last_term = LastTerm,
                 callback = Cb} = LogRef, Command, Term) ->
   NewPos = next_index(LogRef),
-  logger:debug("Storing log entry on index ~p with term ~p command ~p", [NewPos, Term, Command]),
+  ?LOG_DEBUG("Storing log entry on index ~p with term ~p command ~p", [NewPos, Term, Command]),
   LogEntry = #log_entry{log_index = NewPos, term = Term, command = Command},
   NewRef = apply(Cb, store, [Ref, NewPos, LogEntry]),
   LogRef#log_ref{last_index = NewPos,
@@ -243,7 +244,7 @@ maybe_cleanup(Ref, undefined, Index) ->
 maybe_cleanup(Ref = #log_ref{data_ref = DataRef, callback = Cb}, From, Index)
   when From =< Index-1 ->
   To = Index-1,
-  logger:debug("Cleanup indexes from ~p to ~p ", [From, To]),
+  ?LOG_DEBUG("Cleanup indexes from ~p to ~p ", [From, To]),
   NewDataRef = lists:foldl(fun(IndexToDel, CDataRef) ->
                              apply(Cb, delete, [CDataRef, IndexToDel])
                            end, DataRef, lists:seq(From, To)),
