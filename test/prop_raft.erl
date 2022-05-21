@@ -24,6 +24,8 @@ prop_test() ->
   application:set_env(raft, max_heartbeat_timeout, 1000),
   application:set_env(raft, min_heartbeat_timeout, 100),
   application:set_env(raft, heartbeat_grace_time, 50),
+  application:set_env(raft, snapshot_chunk_size, 100),
+  application:set_env(raft, max_append_entries_chunk_size, 10),
   put(raft_s, start_cluster()),
   ?FORALL(Cmds, commands(?MODULE),
           ?TRAPEXIT(
