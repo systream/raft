@@ -24,6 +24,9 @@
 
 -define(REPLICATION_TIMEOUT, 2000).
 
+-define(DEFAULT_SNAPSHOT_SIZE, 100000).
+-define(DEFAULT_MAX_CHUNK_SIZE, 100).
+
 -define(CLUSTER_CHANGE_COMMAND, '$raft_cluster_change_command').
 -define(CLUSTER_CHANGE, '$raft_cluster_change').
 -define(JOINT_CLUSTER_CHANGE, '$raft_joint_cluster_change').
@@ -317,7 +320,7 @@ handle_event(info, #vote_req_reply{term = Term, voter = Voter, granted = true}, 
   end;
 handle_event(info, #vote_req_reply{term = Term, voter = Voter, granted = false}, candidate,
              #state{current_term = CurrentTerm} = State) when Term > CurrentTerm ->
-  ?LOG_NOTICE("Vote request reply from ~p contains higher term Term", [Voter, Term]),
+  ?LOG_NOTICE("Vote request reply from ~p contains higher term ~p", [Voter, Term]),
   {next_state, follower, State#state{current_term = Term, voted_for = undefined}};
 handle_event(info, #vote_req_reply{term = Term, voter = Voter}, candidate,
              #state{current_term = CurrentTerm} = State) when Term < CurrentTerm ->
@@ -986,7 +989,7 @@ send_append_req(Peer, Log, Term, CommittedIndex, Cluster) ->
   Server = raft_peer:server(Peer),
   PrevIndex = NextIndex-1,
 
-  MaxChunk = application:get_env(raft, max_append_entries_chunk_size, 100),
+  MaxChunk = application:get_env(raft, max_append_entries_chunk_size, ?DEFAULT_MAX_CHUNK_SIZE),
   case raft_log:list(Log, NextIndex, MaxChunk) of
     {ok, EndIndex, Entries} ->
       PrevLogTerm = raft_log:get_term(Log, PrevIndex, Term),
@@ -1025,14 +1028,15 @@ update_peers(Peers, Cluster, Log) ->
   Members = raft_cluster:members(Cluster) -- [raft_cluster:leader(Cluster)],
   PeerMembers = maps:keys(Peers),
 
-  % remove pees which not included in members
+  % remove peers which not included in members
   PeersToRemove = PeerMembers -- Members,
   NewPeers = lists:foldl(fun maps:remove/2, Peers, PeersToRemove),
 
   % add new peers
   PeersToAdd = Members -- PeerMembers,
+  LastIndex = raft_log:last_index(Log),
   lists:foldl(fun(Server, Acc) ->
-                Acc#{Server => raft_peer:new(Server, Log)}
+                Acc#{Server => raft_peer:new(Server, LastIndex)}
               end, NewPeers, PeersToAdd).
 
 replicated(Server, _MatchIndex, State) when Server =:= self() ->
@@ -1120,7 +1124,7 @@ commit_index(Server, #state{committed_index = Ci} = State, Index, From) when Ind
 
 maybe_store_snapshot(#state{log = Log, last_applied = LastApplied} = State) ->
   %@TODO better log compaction trigger logic
-  SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, 100000),
+  SnapshotChunkSize = application:get_env(raft, snapshot_chunk_size, ?DEFAULT_SNAPSHOT_SIZE),
   {ok, NewLog} = case LastApplied rem SnapshotChunkSize of
                     0 when LastApplied > 1 ->
                       raft_log:store_snapshot(Log, LastApplied, State#state.user_state);

@@ -26,10 +26,10 @@
          match_index/1, match_index/2,
          next_index/1, server/1, next_index/2]).
 
--spec new(pid(), raft_log:log_ref()) -> peer().
-new(Server, Log) when is_pid(Server) ->
+-spec new(pid(), log_index()) -> peer().
+new(Server, NextIndex) when is_pid(Server) ->
   #raft_peer{server = Server,
-             next_index = raft_log:last_index(Log),
+             next_index = NextIndex,
              match_index = 0}.
 
 -spec send(peer(), Msg :: term()) -> peer().
