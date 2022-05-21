@@ -8,11 +8,11 @@ on:
 
 jobs:
 
-  build-22:
+  build-23:
     runs-on: ubuntu-latest
 
     container:
-      image: erlang:22
+      image: erlang:23
 
     steps:
     - uses: actions/checkout@v2
@@ -21,11 +21,11 @@ jobs:
     - name: Run tests
       run: rebar3 test
 
-  build-23:
+  build-24:
     runs-on: ubuntu-latest
 
     container:
-      image: erlang:23
+      image: erlang:24
 
     steps:
     - uses: actions/checkout@v2

@@ -11,7 +11,7 @@
 -export([start/1, start/2, stop/1,
          join/2, leave/2,
          status/1,
-         command/2, command/3, query/2]).
+         command/2, query/2]).
 
 -spec start(module()) -> {ok, pid()} | {error, term()}.
 start(Callback) ->
