@@ -442,20 +442,23 @@ handle_event(info, #install_snapshot_req{term = Term,
 
   NewState = State#state{user_state = UserState, log = NewLog2,
                          committed_index = LastIndex,
-                         last_applied = LastIndex, cluster = Cluster
+                         current_term = Term,
+                         last_applied = LastIndex,
+                         cluster = Cluster,
+                         voted_for = undefined
   },
   send_msg(Leader, #append_entries_resp{term = Term,
                                         server = self(),
                                         success = true,
                                         match_index = raft_log:last_index(NewLog2)}),
-  {next_state, follower, NewState#state{voted_for = undefined}, [?ELECTION_TIMEOUT]};
+  {next_state, follower, NewState, [?ELECTION_TIMEOUT]};
 
 handle_event(info, #install_snapshot_req{term = Term,
                                          leader = Leader,
                                          last_included_index = LastIndex,
                                          last_included_term = LastTerm,
                                          cluster = Cluster,
-                                         user_state = UserState} = Isr, StateName,
+                                         user_state = UserState}, StateName,
   #state{current_term = Term, log = Log} = State) ->
   NewLog1 = raft_log:delete(Log, LastIndex),
   NewLog2 = raft_log:store_snapshot(NewLog1, LastIndex, LastTerm, UserState),
